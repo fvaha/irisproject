@@ -60,11 +60,11 @@ function svgUse(id: string, viewBox: string, cls: string) {
 const icon = (id: string, cls = 'icon') => svgUse(`i-${id}`, '0 0 20 20', cls)
 const eyeMark = (cls = 'eye-mark') => {
   const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
-  s.setAttribute('viewBox', '0 0 48 28')
+  s.setAttribute('viewBox', '0 0 24 24')
   s.setAttribute('class', cls)
   s.setAttribute('aria-hidden', 'true')
   s.setAttribute('focusable', 'false')
-  s.innerHTML = '<path d="M2 14 C8 3 40 3 46 14 C40 25 8 25 2 14 Z" fill="var(--iris-vermilion)" stroke="var(--iris-cream)" stroke-width="1.5" stroke-linejoin="round" paint-order="stroke fill"/><path d="M24 8 C21 11 21 17 24 20 C27 17 27 11 24 8 Z" fill="var(--iris-ink)"/>'
+  s.innerHTML = '<rect x="2.2" y="5.4" width="19.6" height="13.2" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M3.4 6.9 L12 12.6 L20.6 6.9" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>'
   return s
 }
 const mascot = (id: 'cat-peek' | 'cat-sleep', cls = 'mascot') => svgUse(id, id === 'cat-peek' ? '0 -4 160 82' : '0 0 260 150', cls)
@@ -99,7 +99,7 @@ const errorText: Record<string, string> = {
   too_many_reads: 'Too many reads. Wait a moment and try again.',
   mail_server_unavailable: 'Mail server is unavailable. Try again shortly.',
   mail_server_error: 'The mail server returned an unexpected response. Try again shortly.',
-  database_unavailable: 'IRIS is temporarily unavailable. Try again shortly.',
+  database_unavailable: 'Servis je privremeno nedostupan. Pokušaj ponovo za koji minut.',
   turnstile_failed: 'Verification failed. Please try again.',
   turnstile_unavailable: 'Verification is temporarily unavailable. Please try again shortly.',
   network: 'Can’t reach IRIS. Check your connection and try again.',
@@ -110,7 +110,7 @@ const tempErrors: Record<string, string> = {
   network: errorText.network,
 }
 
-const brand = (sub: string) => h('a', { href: '#/', className: 'brand', ariaLabel: 'IRIS home' }, h('span', { className: 'brand-mark' }, eyeMark(), 'IRIS'), h('span', { className: 'brand-sub' }, sub))
+const brand = (sub: string) => h('a', { href: '#/', className: 'brand', ariaLabel: 'vahid.im — početna' }, h('span', { className: 'brand-mark' }, eyeMark(), 'vahid.im'), h('span', { className: 'brand-sub' }, sub))
 
 // ---------- cat with trackable eyes ----------
 const CAT_BODY = `
@@ -205,7 +205,7 @@ function field(id: string, label: string, ic: string, input: HTMLInputElement, e
 }
 
 function renderLogin() {
-  setPage({ title: 'Sign in', description: 'Sign in to IRIS, the self-hosted mailbox from Meow Labs — or grab a 1-hour temporary inbox, no sign-up needed.', path: '/' })
+  setPage({ title: 'Sign in', description: 'Prijavi se na webmail.vahid.im svojim mejl nalogom.', path: '/' })
   const status = h('div', { className: 'form-error', role: 'alert' })
   const email = h('input', { type: 'email', name: 'email', id: 'email', autocomplete: 'username', inputMode: 'email', placeholder: 'you@example.com', spellcheck: false }) as HTMLInputElement
   const password = h('input', { type: 'password', name: 'password', id: 'password', autocomplete: 'current-password' }) as HTMLInputElement
@@ -220,7 +220,7 @@ function renderLogin() {
   const emailF = field('email', 'Email', 'mail', email)
   const pwF = field('password', 'Password', 'lock', password, showPw)
 
-  const catWrap = h('div', { className: 'mascot-wrap' }, catSitSVG(false))
+  const catWrap = h('div', { className: 'mascot-wrap' })
   trackEyes(email, catWrap)
 
   // Turnstile widget, only when a site key is baked into the build.
@@ -264,13 +264,13 @@ function renderLogin() {
   }
 
   const left = h('div', { className: 'login-left' },
-    h('div', { className: 'topline' }, h('span', { className: 'wordmark' }, eyeMark('eye-mark wordmark-eye'), 'IRIS'), h('span', {}, 'Meow Labs')),
-    h('p', { className: 'login-tagline' }, h('span', {}, 'Every'), h('span', {}, 'message'), h('span', {}, 'finds'), h('span', {}, 'its way.')),
+    h('div', { className: 'topline' }, h('span', { className: 'wordmark' }, eyeMark('eye-mark wordmark-eye'), 'vahid.im'), h('span', {}, 'webmail')),
+    h('p', { className: 'login-tagline' }, h('span', {}, 'Svaka'), h('span', {}, 'poruka'), h('span', {}, 'nađe'), h('span', {}, 'svoj put.')),
     h('div', { className: 'login-route', 'aria-hidden': 'true' }, h('div', { className: 'route-line' }), h('div', { className: 'route-nodes' }, h('span', { className: 'route-node-sq' }), h('span', { className: 'route-node-sq' }), h('span', { className: 'route-node-rd' })), catWrap),
     h('div', { className: 'login-footer' }, h('span', {}, 'MX → Auth → Inbox'), h('span', {}, location.hostname)))
   const form = h('form', { className: 'login-form', noValidate: true },
     emailF.wrap, pwF.wrap, ...(SITE.turnstileSiteKey ? [turnstileBox] : []), status, submit,
-    h('p', { className: 'login-foot' }, 'Need a throwaway? ', h('a', { href: '#/temp', className: 'link' }, 'Temporary inbox →')))
+    h('p', { className: 'login-foot' }, 'Prijava ide tvojim mejl nalogom na vahid.im.'))
   const right = h('main', { className: 'login-right' },
     h('div', { className: 'login-panel' }, h('h1', {}, 'Sign in'), form),
     footerLinks())
@@ -672,14 +672,14 @@ const folderMeta = (r: FolderRole) => FOLDERS.find((f) => f.role === r)!
 let account: { email: string; mb: string } | null = null
 
 const sendErrors: Record<string, string> = {
-  external_sending_disabled: 'IRIS can only send to local addresses for now. Sending to other domains isn’t set up yet.',
+  external_sending_disabled: 'Za sada se može slati samo na lokalne adrese.',
   too_many_sends: 'You’ve reached the sending limit (100 per hour). Try again later.',
   invalid_recipient: 'One of the addresses isn’t valid.',
   no_recipients: 'Add at least one recipient.',
   too_many_recipients: 'Too many recipients (50 max).',
   send_rejected: 'The mail server refused this message.',
   mail_server_error: 'The mail server returned an unexpected response. Try again shortly.',
-  database_unavailable: 'IRIS is temporarily unavailable. Try again shortly.',
+  database_unavailable: 'Servis je privremeno nedostupan. Pokušaj ponovo za koji minut.',
   network: errorText.network,
 }
 
@@ -907,7 +907,7 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
   const { email, mb } = account
   const meta = folderMeta(folder)
   const base = `/api/v1/mailboxes/${mb}`
-  setPage({ title: meta.label, description: `Your IRIS ${meta.label.toLowerCase()}.`, path: '/', noindex: true })
+  setPage({ title: meta.label, description: `Tvoj vahid.im ${meta.label.toLowerCase()}.`, path: '/', noindex: true })
 
   let all: Summary[] = (mb && readListCache(email, mb, folder)) || []
   let query = ''
@@ -959,8 +959,6 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
         return a
       }),
       h('a', { href: folderHash(folder), className: 'nav-item nav-mail', 'aria-current': 'page' }, icon('mail'), h('span', { className: 'nav-label' }, 'Mail')),
-      navSection('Temporary'),
-      navItem('#/temp', 'timer', 'Temporary inbox'),
       footerLinks('sidebar-footer'),
     ],
     listTop: [h('header', { className: 'pane-head' }, h('h2', { className: 'pane-title' }, meta.label), unreadChip, refresh), folderTabs],
@@ -1186,7 +1184,6 @@ async function renderTempStart(note = '') {
   }
   simplePage('auth-main',
     h('section', { className: 'auth-card' },
-      h('div', { className: 'cat-peek' }, mascot('cat-peek')),
       h('header', { className: 'auth-head' },
         h('p', { className: 'eyebrow' }, 'Temporary inbox'),
         h('h1', {}, 'Get a disposable address'),
@@ -1209,7 +1206,6 @@ function renderTempExpired(inbox: TempInbox) {
   create.onclick = () => renderTempStart()
   simplePage('auth-main',
     h('section', { className: 'auth-card expired' },
-      mascot('cat-sleep', 'mascot expired-cat'),
       h('h1', {}, 'This address has expired.'),
       h('code', { className: 'temp-address strikethrough' }, inbox.address),
       h('p', { className: 'muted' }, `Its messages were deleted at ${fmtTime(new Date(inbox.expires_at))} and can’t be recovered.`),
@@ -1219,7 +1215,7 @@ function renderTempExpired(inbox: TempInbox) {
 
 async function renderTempInbox(inbox: TempInbox, justCreated = false) {
   stopTemp()
-  setPage({ title: 'Your temporary inbox', description: 'Your disposable IRIS address.', path: '/#/temp', noindex: true })
+  setPage({ title: 'Your temporary inbox', description: 'Tvoja privremena adresa.', path: '/#/temp', noindex: true })
   // Resolve auth state so the topbar reflects a logged-in session instead of
   // always showing "Sign in" (issue: logged-in users saw "Sign in" on /#/temp).
   if (!account) {
@@ -1251,7 +1247,6 @@ async function renderTempInbox(inbox: TempInbox, justCreated = false) {
 
   const copyMain = copyButton(inbox.address, 'Copy address', 'btn btn-primary copy-btn', 'Copy')
   const addressCard = h('div', { className: 'temp-card' },
-    h('div', { className: 'cat-peek' }, mascot('cat-peek')),
     h('span', { className: 'temp-label' }, justCreated ? 'Ready — your temporary address' : 'Your temporary address'),
     h('code', { className: 'temp-address' }, inbox.address),
     h('p', { className: 'temp-caption' }, 'Receive-only · Not for sensitive mail'),
@@ -1324,7 +1319,6 @@ async function renderTempInbox(inbox: TempInbox, justCreated = false) {
 function renderSignedOut() {
   setPage({ title: 'Signed out', description: 'You have been signed out of IRIS.', path: '/#/signed-out', noindex: true })
   simplePage('auth-main', h('section', { className: 'auth-card center' },
-    mascot('cat-sleep', 'mascot expired-cat'),
     h('h1', {}, 'You’re signed out.'),
     h('p', { className: 'muted' }, 'Thanks for using IRIS. Your session and its mail-server password were removed from this device.'),
     h('a', { href: '#/', className: 'btn btn-ink btn-block' }, h('span', { className: 'btn-label' }, 'Sign in again')),
@@ -1356,9 +1350,9 @@ function route() {
   if (!folder) return renderNotFound()
   renderMailbox(folder).catch((err) => {
     if ((err as HttpError).status === 401) { account = null; return renderLogin() }
-    setPage({ title: 'Unavailable', description: 'IRIS is temporarily unavailable.', noindex: true })
+    setPage({ title: 'Unavailable', description: 'vahid.im je privremeno nedostupan.', noindex: true })
     simplePage('auth-main', h('section', { className: 'auth-card center' },
-      h('h1', {}, 'IRIS is unavailable.'),
+      h('h1', {}, 'vahid.im je nedostupan.'),
       errorState(errorText[(err as HttpError).code] ?? 'The service did not respond.', route)))
   })
 }

@@ -34,7 +34,7 @@ function meta(selector: string, attr: string, value: string) {
 
 let currentPath = location.pathname
 export function setPage(p: { title: string; description: string; path?: string; noindex?: boolean }) {
-  const title = p.title === 'IRIS' ? 'IRIS — Every message finds its way' : `${p.title} · IRIS`
+  const title = p.title === 'vahid.im' ? 'vahid.im — Webmail' : `${p.title} · vahid.im`
   const url = SITE.url + (p.path ?? '/')
   document.title = title
   meta('meta[name="description"]', 'content', p.description)
@@ -95,10 +95,10 @@ export function showCookieBanner(force = false) {
   bar.setAttribute('role', 'region')
   bar.setAttribute('aria-label', 'Cookie notice')
   bar.innerHTML = hasAnalytics
-    ? `<p>IRIS uses essential cookies to keep you signed in. With your OK we also count anonymous page views — no message data, ever. <a href="/privacy/#cookies">Details</a></p>
+    ? `<p>vahid.im koristi neophodne kolačiće za prijavu. Uz tvoju dozvolu brojimo i anonimne posete — nikad sadržaj poruka. <a href="/privacy/#cookies">Detalji</a></p>
        <div class="cookie-actions"><button type="button" class="btn btn-secondary" data-c="denied">Essential only</button><button type="button" class="btn btn-ink" data-c="granted">Allow analytics</button></div>`
-    : `<p>IRIS only uses essential cookies to keep you signed in and protect forms. No tracking. <a href="/privacy/#cookies">Details</a></p>
-       <div class="cookie-actions"><button type="button" class="btn btn-ink" data-c="denied">Got it</button></div>`
+    : `<p>vahid.im koristi samo neophodne kolačiće za prijavu i zaštitu formi. Bez praćenja. <a href="/privacy/#cookies">Detalji</a></p>
+       <div class="cookie-actions"><button type="button" class="btn btn-ink" data-c="denied">U redu</button></div>`
   bar.addEventListener('click', (e) => {
     const c = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-c]')?.dataset.c as Consent | undefined
     if (!c) return
@@ -122,6 +122,6 @@ export function footerLinks(cls = 'site-footer') {
   const f = document.createElement('footer')
   f.className = cls
   const year = new Date().getFullYear()
-  f.innerHTML = `<nav aria-label="Legal"><a href="/privacy/">Privacy</a><a href="/terms/">Terms</a>${SITE.contactEmail ? `<a href="mailto:${SITE.contactEmail}">Contact</a>` : ''}<button type="button" class="linklike" data-cookie-settings>Cookies</button></nav><span>© ${year} Meow Labs</span>`
+  f.innerHTML = `<nav aria-label="Legal"><a href="https://vahid.im">vahid.im</a><a href="https://vahid.im">Kontakt</a><button type="button" class="linklike" data-cookie-settings>Kolačići</button></nav><span>© ${year} vahid.im</span>`
   return f
 }
