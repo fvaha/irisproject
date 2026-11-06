@@ -1,7 +1,7 @@
 {
   "name": "IRIS Mail",
   "short_name": "IRIS",
-  "description": "Self-hosted mail and 1-hour temporary inboxes by vahid.im.",
+  "description": "Webmail na vahid.im.",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#F7F7F2",
