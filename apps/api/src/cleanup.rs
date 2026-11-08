@@ -136,10 +136,12 @@ mod tests {
             .unwrap();
         let state = Arc::new(AppState {
             pool: pool.clone(),
+            organize_lock: tokio::sync::Mutex::new(()),
             jmap: iris_mail::JmapClient::new("http://127.0.0.1:9".into()),
             http: reqwest::Client::new(),
             relay: None,
             html_bodies: crate::html_body::HtmlBodyStore::new(),
+            mail_watch: crate::notify::MailWatch::from_limits(),
             config: iris_config::Config {
                 env: "test".into(),
                 host: "127.0.0.1".into(),
@@ -165,6 +167,7 @@ mod tests {
                 password_reset_public_origin: String::new(),
                 resend_api_url: String::new(),
                 mail_content_origin: String::new(),
+                admin_emails: Vec::new(),
             },
         });
         super::run_once(&state).await.unwrap();

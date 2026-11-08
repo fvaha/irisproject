@@ -17,8 +17,34 @@ commitment to ship it.
   per-hour send limits (100/hour).
 - **Attachments & raw view** — MIME parsing, attachment download and
   preview, raw message view, DMARC XML report preview (zip/gzip).
+- **Stars, labels, custom folders, filters** — star and label messages,
+  make your own folders, and filter new mail (from / to / subject contains
+  → move, label, star, mark read). Filters compile to a Sieve script on
+  the mail server, so they run at delivery.
+- **Threading** — messages group into conversations by the mail
+  server's JMAP thread ids; the list shows one row per thread
+  (subject, participants, count, latest snippet) and expanding a
+  thread shows its messages oldest first.
+- **Contacts** — address book with autocomplete in compose; managed on
+  the Organize page (add, edit, delete; one list per user, shared across
+  their mailboxes).
+- **DMARC dashboard** — aggregate DMARC reports across domains: scan the
+  inbox for report attachments (XML, gzip, zip), parse them, store
+  per-report totals and per-source rows, and show totals per domain,
+  per-domain detail, and the worst failing sources.
+- **Admin dashboard** — read-only users, quotas, and delivery status
+  in one place (`#/admin`), gated by the `IRIS_ADMIN_EMAILS`
+  allow-list (empty = nobody is an admin).
 - **Temporary inboxes** — anonymous, receive-only, 1-hour addresses;
-  10 creates/hour per IP, 3 active per browser.
+  10 creates/hour per IP, 3 active per browser. Extendable by 1 hour,
+  up to 5 times and 24 hours total life, or deleted early from the
+  temp view (the address stops at once; the retention job purges its
+  mail and flips the row to `deleted`).
+- **Real-time notifications** — new mail arrives over a server-sent
+  event stream: one shared watcher per mailbox polls the inbox
+  snapshot (size + newest message) every 15 s and pushes a notice
+  when mail arrives; the 30 s list poll stays as a fallback while
+  the stream is down.
 - **Transactional email API** — scoped API keys for companion apps
   (per-template scopes, daily limits, CLI key management). The app
   registry is configuration: set `IRIS_INTEGRATION_APPS` (JSON) to
@@ -34,17 +60,9 @@ commitment to ship it.
 
 ## Planned
 
-- **Admin dashboard** — users, quotas, and delivery status in one place.
 - **Audit trail** — who did what, when, for logins, sends, and key use.
-- **Threading** — group messages into conversations.
-- **Labels, stars, custom folders, filters** — beyond the five fixed folders.
-- **Contacts** — address book with autocomplete in compose.
-- **Real-time notifications** — new mail without polling.
-- **DMARC dashboard** — aggregate DMARC reports across domains.
-- **Temp inbox extend/delete** — extend an address past 1 hour, or delete
-  it early.
-- **Attachments + HTML compose + signatures** — compose with attachments,
-  rich-text mail, and per-mailbox signatures.
+- **HTML compose + signatures** — rich-text mail and per-mailbox
+  signatures (compose attachments shipped in PR #16).
 - **Multi-mailbox UI** — manage several permanent mailboxes from one login.
 - **Main-page CSP** — a strict Content-Security-Policy for the app shell
   (blocked on the inline-script refactor in `index.html`).

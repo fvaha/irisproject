@@ -7,8 +7,10 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
 reqwest = { workspace = true }
 thiserror = "1.0"
 flate2 = "1.0"
 zip = "9"
+quick-xml = { workspace = true }
 iris-config = { path = "../config" }

@@ -1,9 +1,14 @@
 //! Minimal JMAP client. Every call uses the end user's own credentials
 //! (never an admin credential), per TRD §5.
-use iris_config::limits::{MAX_DESTROY_PER_CALL, MAX_PREVIEW_TEXT};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use iris_config::limits::{
+    MAX_CLEAR_KEYWORD_BATCHES, MAX_DESTROY_PER_CALL, MAX_PREVIEW_TEXT, MAX_THREAD_MESSAGES,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
+
+pub mod dmarc;
 
 #[derive(Debug, Error)]
 pub enum MailError {
@@ -18,6 +23,9 @@ pub enum MailError {
     /// The mail server refused to send (e.g. recipient rejected).
     #[error("rejected: {0}")]
     Rejected(String),
+    /// A folder still holds messages, so it cannot be deleted.
+    #[error("folder is not empty")]
+    NotEmpty,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -32,6 +40,54 @@ pub struct MessageSummary {
     pub is_draft: bool,
     pub has_attachment: bool,
     pub size_bytes: u64,
+    /// `$flagged` keyword.
+    pub is_starred: bool,
+    /// IRIS labels: the message's keywords that are valid label names
+    /// (no `$` system keywords), sorted.
+    pub labels: Vec<String>,
+    /// JMAP thread this message belongs to (`Email.threadId`). `None`
+    /// when the server did not report one; the web then treats the
+    /// message as a thread of its own.
+    pub thread_id: Option<String>,
+}
+
+/// One JMAP thread: every message in the conversation, oldest first.
+/// The subject is the newest message's subject (first non-empty one
+/// scanning newest-first), so a re-titled reply still shows the
+/// subject the conversation ended with.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadDetail {
+    pub thread_id: String,
+    pub subject: String,
+    pub messages: Vec<MessageDetail>,
+}
+
+/// What one inbox poll sees: the inbox size and its newest message.
+/// Only what the new-mail rule needs — no bodies, no list.
+///
+/// Change rule (`new_mail_count`): a new arrival grows `total`, or
+/// replaces `newest_id` while `total` stays flat (an arrival plus a
+/// deletion inside one poll interval). Deliberately NOT the JMAP
+/// `queryState`: verified against Stalwart v1.0.1 that `queryState`
+/// also changes when a message is merely marked read, so it cannot
+/// tell an arrival from a read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboxSnapshot {
+    pub total: u64,
+    pub newest_id: Option<String>,
+}
+
+/// How many messages arrived between two inbox snapshots. A bigger
+/// `total` is that many arrivals; a changed newest message with a
+/// flat total is one arrival (something else left in the same
+/// interval). Anything else — a read, a move out, a delete — is zero.
+pub fn new_mail_count(prev: &InboxSnapshot, next: &InboxSnapshot) -> u64 {
+    let delta = next.total.saturating_sub(prev.total);
+    if delta == 0 && next.newest_id.is_some() && next.newest_id != prev.newest_id {
+        1
+    } else {
+        delta
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,7 +146,8 @@ pub struct ExtractedText {
     pub truncated: bool,
 }
 
-/// A folder (JMAP mailbox) with its standard role.
+/// A folder (JMAP mailbox): one of the standard roles, or `custom` for a
+/// user-made folder (a mailbox with no role).
 #[derive(Debug, Clone, Serialize)]
 pub struct Folder {
     pub id: String,
@@ -109,6 +166,36 @@ pub const FOLDER_ROLES: [(&str, &str); 5] = [
     ("trash", "Trash"),
 ];
 
+/// `Folder::role` of a user-made folder.
+pub const CUSTOM_ROLE: &str = "custom";
+
+/// Name of the Sieve script IRIS owns for a mailbox's filters.
+pub const FILTER_SCRIPT_NAME: &str = "iris-filters";
+
+/// What a message list shows.
+#[derive(Debug, Clone, Copy)]
+pub enum View<'a> {
+    /// A standard folder by role (inbox, sent, drafts, archive, trash).
+    Role(&'a str),
+    /// A custom folder by JMAP mailbox id.
+    Folder(&'a str),
+    /// Starred messages in every folder except Trash.
+    Starred,
+    /// Messages with this label in every folder except Trash.
+    Label(&'a str),
+}
+
+/// True for a valid IRIS label name: 1-32 of `a-z 0-9 _ -`, starting with a
+/// letter or digit. This is also what makes it safe as a JMAP keyword, a
+/// JSON-pointer segment (`keywords/<name>`) and a Sieve flag.
+pub fn valid_label(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
 /// An outgoing message or draft. `from` is always the signed-in user.
 #[derive(Debug, Clone, Default)]
 pub struct Compose {
@@ -120,6 +207,26 @@ pub struct Compose {
     pub text: String,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
+    /// Files to attach. Bytes are already validated and bounded by the API
+    /// (see `iris_config::limits`); the mail crate never re-checks sizes,
+    /// it only uploads what it is given.
+    pub attachments: Vec<ComposeAttachment>,
+}
+
+/// One file attached to an outgoing message: validated by the API, in memory.
+#[derive(Debug, Clone)]
+pub struct ComposeAttachment {
+    pub name: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// A composed attachment after upload: the blob id JMAP references.
+#[derive(Debug, Clone)]
+pub struct UploadedAttachment {
+    pub blob_id: String,
+    pub name: String,
+    pub content_type: String,
 }
 
 #[derive(Clone)]
@@ -130,12 +237,13 @@ pub struct JmapClient {
 
 const USING: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"];
 const USING_STALWART: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"];
+const USING_SIEVE: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:sieve"];
 const USING_SUBMIT: [&str; 3] = [
     "urn:ietf:params:jmap:core",
     "urn:ietf:params:jmap:mail",
     "urn:ietf:params:jmap:submission",
 ];
-const SUMMARY_PROPS: [&str; 8] = [
+const SUMMARY_PROPS: [&str; 9] = [
     "from",
     "to",
     "subject",
@@ -144,6 +252,7 @@ const SUMMARY_PROPS: [&str; 8] = [
     "keywords",
     "size",
     "hasAttachment",
+    "threadId",
 ];
 
 /// JMAP `Email/query` filter for one folder, optionally narrowed by a
@@ -155,13 +264,26 @@ const SUMMARY_PROPS: [&str; 8] = [
 /// may not match yet; the web UI keeps its local `matches()` filter as a
 /// fallback for the list it already loaded.
 fn folder_filter(mailbox_id: &str, query: Option<&str>) -> Value {
-    let in_mailbox = json!({ "inMailbox": mailbox_id });
+    with_text(json!({ "inMailbox": mailbox_id }), query)
+}
+
+/// Starred / label views: a keyword anywhere except Trash.
+fn keyword_filter(keyword: &str, trash_id: Option<&str>, query: Option<&str>) -> Value {
+    let mut conditions = vec![json!({ "hasKeyword": keyword })];
+    if let Some(t) = trash_id {
+        conditions.push(json!({ "inMailboxOtherThan": [t] }));
+    }
+    let base = json!({ "operator": "AND", "conditions": conditions });
+    with_text(base, query)
+}
+
+fn with_text(base: Value, query: Option<&str>) -> Value {
     match query.map(str::trim).filter(|q| !q.is_empty()) {
         Some(q) => json!({
             "operator": "AND",
-            "conditions": [in_mailbox, { "text": q }],
+            "conditions": [base, { "text": q }],
         }),
-        None => in_mailbox,
+        None => base,
     }
 }
 
@@ -377,19 +499,50 @@ impl JmapClient {
         role: &str,
         page: ListPage<'_>,
     ) -> Result<(Vec<MessageSummary>, u64), MailError> {
+        self.list_view(user, pass, account, View::Role(role), page)
+            .await
+    }
+
+    /// Lists one view (standard folder, custom folder, starred, label),
+    /// newest first. A custom folder id that is not a custom folder of this
+    /// account is `NotFound`.
+    pub async fn list_view(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        view: View<'_>,
+        page: ListPage<'_>,
+    ) -> Result<(Vec<MessageSummary>, u64), MailError> {
         let folders = self.folders(user, pass, account).await?;
-        let inbox = folders
+        let trash = folders
             .iter()
-            .find(|f| f.role == role)
-            .ok_or(MailError::NotFound)?
-            .id
-            .clone();
+            .find(|f| f.role == "trash")
+            .map(|f| f.id.as_str());
+        let filter = match view {
+            View::Role(role) => {
+                let f = folders
+                    .iter()
+                    .find(|f| f.role == role)
+                    .ok_or(MailError::NotFound)?;
+                folder_filter(&f.id, page.query)
+            }
+            View::Folder(id) => {
+                let f = folders
+                    .iter()
+                    .find(|f| f.role == CUSTOM_ROLE && f.id == id)
+                    .ok_or(MailError::NotFound)?;
+                folder_filter(&f.id, page.query)
+            }
+            View::Starred => keyword_filter("$flagged", trash, page.query),
+            View::Label(name) => keyword_filter(name, trash, page.query),
+        };
         let r = self
             .call(
                 user,
                 pass,
                 json!([
-                    ["Email/query", {"accountId": account, "filter": folder_filter(&inbox, page.query),
+                    ["Email/query", {"accountId": account, "filter": filter,
                         "sort": [{"property": "receivedAt", "isAscending": false}],
                         "position": page.position, "limit": page.limit, "calculateTotal": true}, "q"],
                     ["Email/get", {"accountId": account,
@@ -401,6 +554,66 @@ impl JmapClient {
         let total = r[0]["total"].as_u64().unwrap_or(0);
         let list = r[1]["list"].as_array().cloned().unwrap_or_default();
         Ok((list.iter().map(summary).collect(), total))
+    }
+
+    /// One cheap inbox poll for the mail watcher: the inbox size and its
+    /// newest message id, in a single `Email/query` (limit 1, newest
+    /// first). No bodies, no list, no folder lookup: the caller resolved
+    /// `inbox_id` once when the watcher started.
+    pub async fn inbox_snapshot(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        inbox_id: &str,
+    ) -> Result<InboxSnapshot, MailError> {
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([["Email/query", {"accountId": account,
+                    "filter": {"inMailbox": inbox_id},
+                    "sort": [{"property": "receivedAt", "isAscending": false}],
+                    "position": 0, "limit": 1, "calculateTotal": true}, "q"]]),
+            )
+            .await?;
+        Ok(snapshot_from_query(&r[0]))
+    }
+
+    /// Inbox messages that carry attachments, newest first. The DMARC scan
+    /// starts here: aggregate reports always arrive as attachments
+    /// (`.xml`, `.xml.gz`, `.zip`), so a plain inbox listing would waste
+    /// a detail fetch on every attachment-less message.
+    pub async fn list_attachment_messages(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        limit: u32,
+    ) -> Result<Vec<MessageSummary>, MailError> {
+        let folders = self.folders(user, pass, account).await?;
+        let inbox = folders
+            .iter()
+            .find(|f| f.role == "inbox")
+            .ok_or(MailError::NotFound)?;
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([
+                    ["Email/query", {"accountId": account,
+                        "filter": {"operator": "AND", "conditions": [
+                            {"inMailbox": inbox.id}, {"hasAttachment": true}]},
+                        "sort": [{"property": "receivedAt", "isAscending": false}],
+                        "position": 0, "limit": limit, "calculateTotal": false}, "q"],
+                    ["Email/get", {"accountId": account,
+                        "#ids": {"resultOf": "q", "name": "Email/query", "path": "/ids"},
+                        "properties": SUMMARY_PROPS}, "g"]
+                ]),
+            )
+            .await?;
+        let list = r[1]["list"].as_array().cloned().unwrap_or_default();
+        Ok(list.iter().map(summary).collect())
     }
 
     /// Messages in `account` whose To: header contains exactly `to`, received after `after` (UTC RFC3339).
@@ -485,19 +698,105 @@ impl JmapClient {
                 .cloned()
                 .unwrap_or_default();
         }
-        Ok(FOLDER_ROLES
-            .iter()
-            .filter_map(|(role, _)| {
-                let m = list.iter().find(|m| m["role"] == *role)?;
-                Some(Folder {
-                    id: m["id"].as_str()?.to_string(),
-                    role: role.to_string(),
-                    name: m["name"].as_str().unwrap_or(role).to_string(),
-                    total: m["totalEmails"].as_u64().unwrap_or(0),
-                    unread: m["unreadEmails"].as_u64().unwrap_or(0),
-                })
+        let folder = |m: &Value, role: &str| {
+            Some(Folder {
+                id: m["id"].as_str()?.to_string(),
+                role: role.to_string(),
+                name: m["name"].as_str().unwrap_or(role).to_string(),
+                total: m["totalEmails"].as_u64().unwrap_or(0),
+                unread: m["unreadEmails"].as_u64().unwrap_or(0),
             })
-            .collect())
+        };
+        let mut out: Vec<Folder> = FOLDER_ROLES
+            .iter()
+            .filter_map(|(role, _)| folder(list.iter().find(|m| m["role"] == *role)?, role))
+            .collect();
+        // Custom folders: every mailbox without a role, by name.
+        let mut custom: Vec<Folder> = list
+            .iter()
+            .filter(|m| m["role"].is_null())
+            .filter_map(|m| folder(m, CUSTOM_ROLE))
+            .collect();
+        custom.sort_by_key(|f| f.name.to_lowercase());
+        out.extend(custom);
+        Ok(out)
+    }
+
+    /// Creates a top-level custom folder; returns its id.
+    pub async fn create_folder(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        name: &str,
+    ) -> Result<String, MailError> {
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([["Mailbox/set", {"accountId": account,
+                "create": {"n": {"name": name, "parentId": null}}}, "s"]]),
+            )
+            .await?;
+        r[0]["created"]["n"]["id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                MailError::Protocol(format!("folder not created: {}", r[0]["notCreated"]))
+            })
+    }
+
+    /// Renames a folder. The caller checks it is a custom folder.
+    pub async fn rename_folder(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        id: &str,
+        name: &str,
+    ) -> Result<(), MailError> {
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([["Mailbox/set", {"accountId": account,
+                "update": {id: {"name": name}}}, "s"]]),
+            )
+            .await?;
+        updated(&r[0], id)
+    }
+
+    /// Deletes an empty folder. A folder that still holds messages is
+    /// `NotEmpty`: its mail is never deleted along with it.
+    pub async fn delete_folder(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        id: &str,
+    ) -> Result<(), MailError> {
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([["Mailbox/set", {"accountId": account,
+                "destroy": [id], "onDestroyRemoveEmails": false}, "s"]]),
+            )
+            .await?;
+        if r[0]["destroyed"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|x| x == id))
+        {
+            return Ok(());
+        }
+        match r[0]["notDestroyed"][id]["type"].as_str() {
+            Some("mailboxHasEmail") | Some("mailboxHasChild") => Err(MailError::NotEmpty),
+            Some("notFound") => Err(MailError::NotFound),
+            _ => Err(MailError::Protocol(format!(
+                "folder not deleted: {}",
+                r[0]["notDestroyed"]
+            ))),
+        }
     }
 
     async fn folder_id(
@@ -545,6 +844,19 @@ impl JmapClient {
         role: &str,
     ) -> Result<(), MailError> {
         let target = self.folder_id(user, pass, account, role).await?;
+        self.move_to_id(user, pass, account, id, &target).await
+    }
+
+    /// Moves a message into exactly one folder, by mailbox id. The caller
+    /// checks the id is one of this account's folders.
+    pub async fn move_to_id(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        id: &str,
+        target: &str,
+    ) -> Result<(), MailError> {
         let r = self
             .call(
                 user,
@@ -564,16 +876,254 @@ impl JmapClient {
         id: &str,
         seen: bool,
     ) -> Result<(), MailError> {
-        let patch = if seen { json!(true) } else { Value::Null };
+        self.set_keyword(user, pass, account, id, "$seen", seen)
+            .await
+    }
+
+    /// Adds or removes one keyword (`$seen`, `$flagged`, or a label). The
+    /// keyword is used as a JSON-pointer segment, so the caller passes only
+    /// `$seen`/`$flagged` or a `valid_label` name (no `/` or `~`).
+    pub async fn set_keyword(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        id: &str,
+        keyword: &str,
+        on: bool,
+    ) -> Result<(), MailError> {
+        let patch = if on { json!(true) } else { Value::Null };
+        let mut update = serde_json::Map::new();
+        update.insert(format!("keywords/{keyword}"), patch);
         let r = self
             .call(
                 user,
                 pass,
                 json!([["Email/set", {"accountId": account,
-            "update": {id: {"keywords/$seen": patch}}}, "u"]]),
+            "update": {id: update}}, "u"]]),
             )
             .await?;
         updated(&r[0], id)
+    }
+
+    /// Removes a label keyword from every message that carries it.
+    /// `Email/query` returns at most `MAX_DESTROY_PER_CALL` ids, so a label
+    /// on more messages is cleared in passes: each pass removes the keyword
+    /// from the messages it found, so the next query finds the rest.
+    /// Returns how many were updated. Fails past `MAX_CLEAR_KEYWORD_BATCHES`
+    /// passes instead of looping forever; the caller then keeps the label,
+    /// so no message is left carrying a keyword whose label row is gone.
+    pub async fn clear_keyword(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        keyword: &str,
+    ) -> Result<usize, MailError> {
+        let mut total = 0;
+        for _ in 0..MAX_CLEAR_KEYWORD_BATCHES {
+            let r = self
+                .call(
+                    user,
+                    pass,
+                    json!([["Email/query", {"accountId": account,
+                    "filter": {"hasKeyword": keyword}, "limit": MAX_DESTROY_PER_CALL}, "q"]]),
+                )
+                .await?;
+            let ids: Vec<&str> = r[0]["ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if ids.is_empty() {
+                return Ok(total);
+            }
+            let mut update = serde_json::Map::new();
+            for id in &ids {
+                update.insert(
+                    id.to_string(),
+                    json!({ format!("keywords/{keyword}"): null }),
+                );
+            }
+            let r = self
+                .call(
+                    user,
+                    pass,
+                    json!([["Email/set", {"accountId": account, "update": update}, "u"]]),
+                )
+                .await?;
+            total += r[0]["updated"].as_object().map_or(0, |o| o.len());
+        }
+        Err(MailError::Protocol(format!(
+            "clear_keyword: {keyword} still on messages after {MAX_CLEAR_KEYWORD_BATCHES} passes"
+        )))
+    }
+
+    /// Installs (or with `None`, removes) the IRIS filter Sieve script and
+    /// makes it the active script. Activating it deactivates any other
+    /// script on the account: Sieve allows one active script.
+    pub async fn put_filter_script(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        script: Option<&str>,
+    ) -> Result<(), MailError> {
+        let r = self
+            .call_using(
+                user,
+                pass,
+                &USING_SIEVE,
+                json!([["SieveScript/get", {"accountId": account,
+                "ids": null, "properties": ["name", "isActive"]}, "g"]]),
+            )
+            .await?;
+        let existing = r[0]["list"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|s| s["name"] == FILTER_SCRIPT_NAME)
+            .cloned();
+        let existing_id = existing
+            .as_ref()
+            .and_then(|s| s["id"].as_str())
+            .map(str::to_string);
+        let Some(script) = script else {
+            let Some(id) = existing_id else { return Ok(()) };
+            let was_active = existing.as_ref().is_some_and(|s| s["isActive"] == true);
+            let mut calls = vec![];
+            if was_active {
+                calls.push(json!(["SieveScript/set", {"accountId": account, "onSuccessDeactivateScript": true}, "a"]));
+            }
+            calls.push(json!(["SieveScript/set", {"accountId": account, "destroy": [id]}, "d"]));
+            let r = self
+                .call_using(user, pass, &USING_SIEVE, Value::Array(calls))
+                .await?;
+            let last = r.last().cloned().unwrap_or_default();
+            if last["destroyed"].as_array().is_some_and(|d| !d.is_empty()) {
+                return Ok(());
+            }
+            // The deactivate in this same request already ran, so the script
+            // is now inactive while the caller (filter delete) restores the
+            // database rule on this error. Reactivate it, so the running
+            // script still matches the stored rules instead of silently
+            // stopping every filter.
+            if was_active {
+                let reactivated = match self
+                    .call_using(
+                        user,
+                        pass,
+                        &USING_SIEVE,
+                        json!([["SieveScript/set", {"accountId": account, "onSuccessActivateScript": id}, "r"]]),
+                    )
+                    .await
+                {
+                    Ok(r) => {
+                        let first = r.first().cloned().unwrap_or_default();
+                        !["notCreated", "notUpdated", "notDestroyed"].iter().any(|k| {
+                            first[k].as_object().is_some_and(|o| !o.is_empty())
+                        })
+                    }
+                    Err(_) => false,
+                };
+                if !reactivated {
+                    return Err(MailError::Protocol(format!(
+                        "filter script not removed and could not be reactivated; filters are inactive: {}",
+                        last["notDestroyed"]
+                    )));
+                }
+            }
+            return Err(MailError::Protocol(format!(
+                "filter script not removed: {}",
+                last["notDestroyed"]
+            )));
+        };
+        let blob = self
+            .upload(
+                user,
+                pass,
+                account,
+                "application/sieve",
+                script.as_bytes().to_vec(),
+            )
+            .await?;
+        let call = match &existing_id {
+            Some(id) => json!(["SieveScript/set", {"accountId": account,
+                "update": {id: {"blobId": blob}}, "onSuccessActivateScript": id}, "s"]),
+            None => json!(["SieveScript/set", {"accountId": account,
+                "create": {"n": {"name": FILTER_SCRIPT_NAME, "blobId": blob}},
+                "onSuccessActivateScript": "#n"}, "s"]),
+        };
+        let r = self
+            .call_using(user, pass, &USING_SIEVE, json!([call]))
+            .await?;
+        let ok = match &existing_id {
+            Some(id) => r[0]["updated"]
+                .as_object()
+                .is_some_and(|o| o.contains_key(id)),
+            None => r[0]["created"]["n"]["id"].is_string(),
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(MailError::Protocol(format!(
+                "filter script not saved: {} {}",
+                r[0]["notCreated"], r[0]["notUpdated"]
+            )))
+        }
+    }
+
+    /// Uploads a blob; returns its id.
+    async fn upload(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<String, MailError> {
+        let resp = self
+            .http
+            .post(format!("{}/jmap/upload/{account}/", self.base_url))
+            .basic_auth(user, Some(pass))
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|e| MailError::Unavailable(e.to_string()))?;
+        let v = check(resp).await?;
+        v["blobId"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| MailError::Protocol("upload: no blobId".into()))
+    }
+
+    /// Uploads every composed attachment, in order, and returns their blob
+    /// ids. Fails fast on the first failed upload: callers run this BEFORE
+    /// any Email/set, so a failed upload never leaves a half-attached
+    /// message behind. Blobs uploaded before the failure are orphaned on
+    /// the server (never referenced by any message); JMAP blobs are
+    /// unaddressable without their id, so nothing leaks.
+    async fn upload_attachments(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        attachments: &[ComposeAttachment],
+    ) -> Result<Vec<UploadedAttachment>, MailError> {
+        let mut out = Vec::with_capacity(attachments.len());
+        for a in attachments {
+            let blob_id = self
+                .upload(user, pass, account, &a.content_type, a.bytes.clone())
+                .await?;
+            out.push(UploadedAttachment {
+                blob_id,
+                name: a.name.clone(),
+                content_type: a.content_type.clone(),
+            });
+        }
+        Ok(out)
     }
 
     /// Permanently deletes one message.
@@ -600,7 +1150,11 @@ impl JmapClient {
         replace: Option<&str>,
     ) -> Result<String, MailError> {
         let drafts = self.folder_id(user, pass, account, "drafts").await?;
-        let mut set = json!({"accountId": account, "create": {"n": email_json(c, &drafts)}});
+        let uploaded = self
+            .upload_attachments(user, pass, account, &c.attachments)
+            .await?;
+        let mut set =
+            json!({"accountId": account, "create": {"n": email_json(c, &drafts, &uploaded)}});
         if let Some(old) = replace {
             set["destroy"] = json!([old]);
         }
@@ -632,7 +1186,12 @@ impl JmapClient {
         };
         let (drafts, sent) = (id_of("drafts")?, id_of("sent")?);
         let identity = self.identity(user, pass, account, &c.from).await?;
-        let mut email_set = json!({"accountId": account, "create": {"n": email_json(c, &drafts)}});
+        // Uploads first: if one fails, no Email/set runs and nothing is sent.
+        let uploaded = self
+            .upload_attachments(user, pass, account, &c.attachments)
+            .await?;
+        let mut email_set =
+            json!({"accountId": account, "create": {"n": email_json(c, &drafts, &uploaded)}});
         if let Some(old) = draft {
             email_set["destroy"] = json!([old]);
         }
@@ -672,7 +1231,10 @@ impl JmapClient {
         draft: Option<&str>,
     ) -> Result<(), MailError> {
         let sent = self.folder_id(user, pass, account, "sent").await?;
-        let mut e = email_json(c, &sent);
+        let uploaded = self
+            .upload_attachments(user, pass, account, &c.attachments)
+            .await?;
+        let mut e = email_json(c, &sent, &uploaded);
         e["keywords"] = json!({"$seen": true});
         let mut set = json!({"accountId": account, "create": {"n": e}});
         if let Some(old) = draft {
@@ -762,24 +1324,12 @@ impl JmapClient {
         account: &str,
         id: &str,
     ) -> Result<MessageDetail, MailError> {
-        let mut props: Vec<&str> = SUMMARY_PROPS.to_vec();
-        props.extend([
-            "textBody",
-            "htmlBody",
-            "bodyValues",
-            "bodyStructure",
-            "attachments",
-            "blobId",
-            "cc",
-            "messageId",
-            "references",
-        ]);
         let r = self
             .call(
                 user,
                 pass,
                 json!([["Email/get", {"accountId": account, "ids": [id],
-                "properties": props, "fetchTextBodyValues": true, "fetchHTMLBodyValues": true,
+                "properties": detail_props(), "fetchTextBodyValues": true, "fetchHTMLBodyValues": true,
                 // Classified body parts alone are not enough: a text part nested
                 // under multipart/mixed or multipart/report (the usual DMARC
                 // shape) may not appear in textBody/htmlBody at all, so also
@@ -790,6 +1340,66 @@ impl JmapClient {
             .await?;
         let e = r[0]["list"].get(0).ok_or(MailError::NotFound)?;
         Ok(detail_from_email(e))
+    }
+
+    /// One thread, oldest first, with bodies. `Thread/get` first resolves
+    /// the thread to its message ids, then `Email/get` fetches them with
+    /// the same properties as `get_message`, so a thread view never needs
+    /// a second fetch per message.
+    ///
+    /// Two round trips on purpose: the ids are capped to
+    /// `MAX_THREAD_MESSAGES` before the fetch, and the cap needs the
+    /// `Thread/get` answer first. Stalwart returns `emailIds` oldest
+    /// first (verified against the local server), so the tail of an
+    /// over-long thread is its newest slice; the fetched details are
+    /// still sorted by `receivedAt` below rather than trusting that.
+    pub async fn get_thread(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        thread_id: &str,
+    ) -> Result<ThreadDetail, MailError> {
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([["Thread/get", {"accountId": account, "ids": [thread_id]}, "t"]]),
+            )
+            .await?;
+        let ids: Vec<&str> = r[0]["list"]
+            .get(0)
+            .and_then(|t| t["emailIds"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if ids.is_empty() {
+            return Err(MailError::NotFound);
+        }
+        let ids: Vec<&str> = if ids.len() > MAX_THREAD_MESSAGES {
+            ids[ids.len() - MAX_THREAD_MESSAGES..].to_vec()
+        } else {
+            ids
+        };
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([["Email/get", {"accountId": account, "ids": ids,
+                "properties": detail_props(), "fetchTextBodyValues": true, "fetchHTMLBodyValues": true,
+                "fetchAllBodyValues": true,
+                "maxBodyValueBytes": 1_000_000}, "g"]]),
+            )
+            .await?;
+        let details: Vec<MessageDetail> = r[0]["list"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(detail_from_email)
+            .collect();
+        thread_from_details(thread_id, details)
     }
 
     /// Streams one JMAP blob (a whole message, or one attachment part) with
@@ -845,6 +1455,68 @@ impl JmapClient {
             .map(|b| b.to_vec())
             .map_err(|e| MailError::Unavailable(e.to_string()))
     }
+}
+
+/// Properties for a full message fetch: the summary set plus bodies.
+/// Classified body parts alone are not enough: a text part nested
+/// under multipart/mixed or multipart/report (the usual DMARC shape)
+/// may not appear in textBody/htmlBody at all, so `fetchAllBodyValues`
+/// is set by the callers and `detail_from_email` walks bodyStructure.
+fn detail_props() -> Vec<&'static str> {
+    let mut props: Vec<&str> = SUMMARY_PROPS.to_vec();
+    props.extend([
+        "textBody",
+        "htmlBody",
+        "bodyValues",
+        "bodyStructure",
+        "attachments",
+        "blobId",
+        "cc",
+        "messageId",
+        "references",
+    ]);
+    props
+}
+
+/// Reads an `Email/query` answer as an `InboxSnapshot`. Pure, so the
+/// parsing can be tested from fixtures without a mail server. A
+/// missing `total` reads as 0 and a missing/empty `ids` as no newest
+/// message; both are what a fresh empty inbox answers.
+fn snapshot_from_query(q: &Value) -> InboxSnapshot {
+    InboxSnapshot {
+        total: q["total"].as_u64().unwrap_or(0),
+        newest_id: q["ids"]
+            .as_array()
+            .and_then(|ids| ids.first())
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+/// Builds a `ThreadDetail` from fetched messages. Pure, so the sort and
+/// subject rules can be tested from fixtures without a mail server.
+/// `receivedAt` is RFC3339 UTC, so string order is chronological order.
+fn thread_from_details(
+    thread_id: &str,
+    mut details: Vec<MessageDetail>,
+) -> Result<ThreadDetail, MailError> {
+    if details.is_empty() {
+        return Err(MailError::NotFound);
+    }
+    details.sort_by(|a, b| a.summary.received_at.cmp(&b.summary.received_at));
+    let subject = details
+        .iter()
+        .rev()
+        .find_map(|d| {
+            let s = d.summary.subject.trim();
+            (!s.is_empty()).then_some(s.to_string())
+        })
+        .unwrap_or_default();
+    Ok(ThreadDetail {
+        thread_id: thread_id.to_string(),
+        subject,
+        messages: details,
+    })
 }
 
 /// Builds a `MessageDetail` from one JMAP Email object. Pure, so the DMARC
@@ -1172,7 +1844,22 @@ fn summary(e: &Value) -> MessageSummary {
         is_draft: e["keywords"]["$draft"] == true,
         has_attachment: e["hasAttachment"] == true,
         size_bytes: e["size"].as_u64().unwrap_or(0),
+        is_starred: e["keywords"]["$flagged"] == true,
+        labels: labels_of(e),
+        thread_id: e["threadId"].as_str().map(str::to_string),
     }
+}
+
+fn labels_of(e: &Value) -> Vec<String> {
+    let mut out: Vec<String> = e["keywords"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, v)| **v == true && valid_label(k))
+        .map(|(k, _)| k.clone())
+        .collect();
+    out.sort();
+    out
 }
 
 fn updated(r: &Value, id: &str) -> Result<(), MailError> {
@@ -1189,7 +1876,11 @@ fn updated(r: &Value, id: &str) -> Result<(), MailError> {
 }
 
 /// JMAP Email/create object for a plain-text message in `mailbox`, flagged as a draft.
-fn email_json(c: &Compose, mailbox: &str) -> Value {
+/// `uploaded` holds the blob ids of already-uploaded attachments (JMAP
+/// EmailBodyPart: `blobId` + `type` + `name`; `disposition` marks them as
+/// attachments rather than inline parts). Empty when there are none, in
+/// which case the `attachments` property is omitted entirely.
+fn email_json(c: &Compose, mailbox: &str, uploaded: &[UploadedAttachment]) -> Value {
     let addrs = |v: &[String]| v.iter().map(|e| json!({"email": e})).collect::<Vec<_>>();
     let mut e = json!({
         "mailboxIds": {mailbox: true},
@@ -1212,6 +1903,17 @@ fn email_json(c: &Compose, mailbox: &str) -> Value {
     if !c.references.is_empty() {
         e["references"] = json!(c.references);
     }
+    if !uploaded.is_empty() {
+        e["attachments"] = json!(uploaded
+            .iter()
+            .map(|a| json!({
+                "blobId": a.blob_id,
+                "type": a.content_type,
+                "name": a.name,
+                "disposition": "attachment",
+            }))
+            .collect::<Vec<_>>());
+    }
     e
 }
 
@@ -1230,14 +1932,47 @@ mod tests {
             references: vec!["m0@x".into(), "m1@x".into()],
             ..Default::default()
         };
-        let e = email_json(&c, "D");
+        let e = email_json(&c, "D", &[]);
         assert_eq!(e["mailboxIds"]["D"], true);
         assert_eq!(e["keywords"]["$draft"], true);
         assert_eq!(e["to"][0]["email"], "b@x.id");
         assert!(e.get("cc").is_none() && e.get("bcc").is_none());
+        assert!(e.get("attachments").is_none());
         assert_eq!(e["bodyValues"]["b"]["value"], "Body");
         assert_eq!(e["inReplyTo"][0], "m1@x");
         assert_eq!(e["references"][1], "m1@x");
+    }
+
+    #[test]
+    fn email_json_emits_attachments() {
+        let c = Compose {
+            from: "a@x.id".into(),
+            to: vec!["b@x.id".into()],
+            subject: "Hi".into(),
+            text: "Body".into(),
+            ..Default::default()
+        };
+        let uploaded = vec![
+            UploadedAttachment {
+                blob_id: "blob-1".into(),
+                name: "notes.txt".into(),
+                content_type: "text/plain".into(),
+            },
+            UploadedAttachment {
+                blob_id: "blob-2".into(),
+                name: "photo.png".into(),
+                content_type: "image/png".into(),
+            },
+        ];
+        let e = email_json(&c, "D", &uploaded);
+        let atts = e["attachments"].as_array().expect("attachments array");
+        assert_eq!(atts.len(), 2);
+        assert_eq!(atts[0]["blobId"], "blob-1");
+        assert_eq!(atts[0]["type"], "text/plain");
+        assert_eq!(atts[0]["name"], "notes.txt");
+        assert_eq!(atts[0]["disposition"], "attachment");
+        assert_eq!(atts[1]["blobId"], "blob-2");
+        assert_eq!(atts[1]["name"], "photo.png");
     }
 
     #[test]
@@ -1448,6 +2183,118 @@ mod tests {
         // A blank search term is the same as no search.
         assert_eq!(folder_filter("m1", Some("   "))["inMailbox"], "m1");
     }
+
+    /// Minimal Email object for thread tests: only what `summary` and
+    /// `detail_from_email` read.
+    fn thread_email(id: &str, thread: &str, subject: &str, received_at: &str) -> Value {
+        json!({
+            "id": id, "threadId": thread,
+            "from": [{"email": "a@example.com"}],
+            "to": [{"email": "b@example.com"}],
+            "subject": subject, "preview": "", "receivedAt": received_at,
+            "keywords": {"$seen": true}, "size": 100, "hasAttachment": false,
+            "textBody": [], "htmlBody": [], "bodyValues": {}, "bodyStructure": {},
+        })
+    }
+
+    #[test]
+    fn summary_carries_thread_id() {
+        let s = summary(&thread_email("m1", "t9", "Hi", "2026-11-08T00:00:00Z"));
+        assert_eq!(s.thread_id.as_deref(), Some("t9"));
+        let mut e = thread_email("m2", "t9", "Hi", "2026-11-08T00:00:00Z");
+        e.as_object_mut().unwrap().remove("threadId");
+        assert_eq!(summary(&e).thread_id, None);
+    }
+
+    #[test]
+    fn thread_from_details_sorts_oldest_first() {
+        let newest = detail_from_email(&thread_email(
+            "m3",
+            "t1",
+            "Re: Launch",
+            "2026-11-08T03:00:00Z",
+        ));
+        let oldest = detail_from_email(&thread_email("m1", "t1", "Launch", "2026-11-08T01:00:00Z"));
+        let middle = detail_from_email(&thread_email(
+            "m2",
+            "t1",
+            "Re: Launch",
+            "2026-11-08T02:00:00Z",
+        ));
+        let t = thread_from_details("t1", vec![newest, oldest, middle]).unwrap();
+        assert_eq!(t.thread_id, "t1");
+        assert_eq!(t.subject, "Re: Launch");
+        let ids: Vec<&str> = t.messages.iter().map(|d| d.summary.id.as_str()).collect();
+        assert_eq!(ids, ["m1", "m2", "m3"]);
+    }
+
+    #[test]
+    fn thread_subject_falls_back_to_older_subject() {
+        let newest = detail_from_email(&thread_email("m2", "t1", "", "2026-11-08T02:00:00Z"));
+        let oldest = detail_from_email(&thread_email("m1", "t1", "Launch", "2026-11-08T01:00:00Z"));
+        let t = thread_from_details("t1", vec![newest, oldest]).unwrap();
+        assert_eq!(t.subject, "Launch");
+    }
+
+    #[test]
+    fn thread_from_details_empty_is_not_found() {
+        assert!(matches!(
+            thread_from_details("t1", vec![]),
+            Err(MailError::NotFound)
+        ));
+    }
+
+    fn snap(total: u64, newest: Option<&str>) -> InboxSnapshot {
+        InboxSnapshot {
+            total,
+            newest_id: newest.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn snapshot_from_query_reads_total_and_newest() {
+        let q = json!({"total": 14, "ids": ["b2aaaaap"], "queryState": "sde"});
+        assert_eq!(snapshot_from_query(&q), snap(14, Some("b2aaaaap")));
+        assert_eq!(
+            snapshot_from_query(&json!({"total": 0, "ids": []})),
+            snap(0, None)
+        );
+        // A missing total or ids list reads as an empty inbox, never a panic.
+        assert_eq!(snapshot_from_query(&json!({})), snap(0, None));
+    }
+
+    #[test]
+    fn new_mail_count_counts_arrivals() {
+        // One arrival: total up, newest replaced.
+        assert_eq!(
+            new_mail_count(&snap(13, Some("a")), &snap(14, Some("b"))),
+            1
+        );
+        // Three arrivals at once.
+        assert_eq!(
+            new_mail_count(&snap(13, Some("a")), &snap(16, Some("d"))),
+            3
+        );
+        // Nothing changed.
+        assert_eq!(
+            new_mail_count(&snap(13, Some("a")), &snap(13, Some("a"))),
+            0
+        );
+        // Arrival plus a deletion in one interval: flat total, new newest.
+        assert_eq!(
+            new_mail_count(&snap(13, Some("a")), &snap(13, Some("b"))),
+            1
+        );
+        // A read or a move out is not an arrival: flat total, same newest.
+        assert_eq!(
+            new_mail_count(&snap(13, Some("a")), &snap(12, Some("a"))),
+            0
+        );
+        // Inbox emptied: no arrival, even though the newest id vanished.
+        assert_eq!(new_mail_count(&snap(1, Some("a")), &snap(0, None)), 0);
+        // First message in an empty inbox.
+        assert_eq!(new_mail_count(&snap(0, None), &snap(1, Some("a"))), 1);
+    }
 }
 
 /// Outbound relay over Resend's HTTP API, used for recipients outside our own domains
@@ -1516,6 +2363,17 @@ fn resend_json(c: &Compose) -> Value {
     if !c.bcc.is_empty() {
         v["bcc"] = json!(c.bcc);
     }
+    if !c.attachments.is_empty() {
+        // Resend's format: base64 content + filename per attachment.
+        v["attachments"] = json!(c
+            .attachments
+            .iter()
+            .map(|a| json!({
+                "content": BASE64.encode(&a.bytes),
+                "filename": a.name,
+            }))
+            .collect::<Vec<_>>());
+    }
     let mut headers = serde_json::Map::new();
     if let Some(r) = &c.in_reply_to {
         headers.insert("In-Reply-To".into(), json!(format!("<{r}>")));
@@ -1557,8 +2415,34 @@ mod resend_tests {
         assert_eq!(v["from"], "a@x.id");
         assert_eq!(v["to"][0], "b@gmail.com");
         assert!(v.get("cc").is_none());
+        assert!(v.get("attachments").is_none());
         assert_eq!(v["bcc"][0], "c@y.id");
         assert_eq!(v["headers"]["In-Reply-To"], "<m1@x>");
         assert_eq!(v["headers"]["References"], "<m0@x> <m1@x>");
+    }
+
+    #[test]
+    fn resend_payload_with_attachments() {
+        let c = Compose {
+            from: "a@x.id".into(),
+            to: vec!["b@gmail.com".into()],
+            subject: "files".into(),
+            text: "t".into(),
+            attachments: vec![ComposeAttachment {
+                name: "hello.txt".into(),
+                content_type: "text/plain".into(),
+                bytes: b"hello".to_vec(),
+            }],
+            ..Default::default()
+        };
+        let v = resend_json(&c);
+        let atts = v["attachments"].as_array().expect("attachments array");
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0]["filename"], "hello.txt");
+        // Resend wants base64 content; it must decode back to the raw bytes.
+        let decoded = BASE64
+            .decode(atts[0]["content"].as_str().expect("base64 string"))
+            .expect("valid base64");
+        assert_eq!(decoded, b"hello");
     }
 }

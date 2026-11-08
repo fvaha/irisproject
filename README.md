@@ -112,6 +112,42 @@ Wrong/missing token: 404/401. Past `expires_at`: 410 `expired` (row flipped to `
 Limits: 10 creates/hour per IP (`X-Real-IP` trusted only from loopback proxy), 3 active per browser (`iris_temp_client` cookie).
 Expired inboxes are purged by the in-process cleanup job (see Deployment). Not yet: extend/delete endpoints, Bcc delivery in the UI (To: header only).
 
+## Stars, labels, folders and filters
+
+Signed-in mailboxes can star messages, tag them with labels, keep their
+own folders next to the five standard ones, and run filters on new mail.
+Web UI: the sidebar (Starred, your folders and labels) and `/#/organize`.
+
+- **Stars** are the JMAP `$flagged` keyword; **labels** are plain JMAP
+  keywords (`a-z 0-9 _ -`, up to 32 chars). Label names are listed in
+  SQLite (`mailbox_labels`) so an unused label still exists.
+- **Custom folders** are JMAP mailboxes without a role. Only empty folders
+  can be deleted; mail is never deleted with a folder.
+- **Filters** (`mail_filters`) are compiled into one Sieve script,
+  `iris-filters`, installed through JMAP for Sieve (RFC 9661) and made the
+  account's active script, so rules run at delivery even when IRIS is
+  closed. Activating it deactivates any other active Sieve script on that
+  account. Requires a mail server with `urn:ietf:params:jmap:sieve` and the
+  `fileinto`, `mailboxid` and `imap4flags` extensions (Stalwart has them).
+
+```text
+GET    /api/v1/mailboxes/:mb/messages?view=starred | label=<name> | folder_id=<id> | folder=<role>
+POST   /api/v1/mailboxes/:mb/messages/:id/star     {starred}
+POST   /api/v1/mailboxes/:mb/messages/:id/labels   {label, on}
+POST   /api/v1/mailboxes/:mb/messages/:id/move     {folder} | {folder_id}
+GET    /api/v1/mailboxes/:mb/labels                -> {labels: [{name}]}
+POST   /api/v1/mailboxes/:mb/labels                {name}
+DELETE /api/v1/mailboxes/:mb/labels/:name          (409 if a filter uses it)
+POST   /api/v1/mailboxes/:mb/folders               {name}
+PATCH  /api/v1/mailboxes/:mb/folders/:id           {name}
+DELETE /api/v1/mailboxes/:mb/folders/:id           (409 folder_not_empty / folder_in_use_by_filter)
+GET    /api/v1/mailboxes/:mb/filters               -> {filters: [{id, field, value, action, target}]}
+POST   /api/v1/mailboxes/:mb/filters               {field: from|to|subject, value, action: move|label|star|read, target}
+DELETE /api/v1/mailboxes/:mb/filters/:id
+```
+
+Limits: 50 labels, 50 custom folders and 50 filters per mailbox.
+
 ## Configuration
 
 Every variable in [`.env.example`](.env.example) is read by the code
@@ -139,6 +175,7 @@ Every variable in [`.env.example`](.env.example) is read by the code
 | `IRIS_RESEND_API_URL` | (empty) | Local fake relay override; accepted only outside `production` and only on localhost |
 | `IRIS_PASSWORD_RESET_SERVICE_TOKEN`, `IRIS_PASSWORD_RESET_EMAIL_FROM`, `IRIS_PASSWORD_RESET_EMAIL_TO`, `IRIS_PASSWORD_RESET_PUBLIC_ORIGIN` | (empty) | Optional password-reset webhook for a trusted companion app; all must be set (plus `RESEND_API_KEY`) for the endpoint to answer. Deprecated `IRIS_TIMELESS_*` / `TIMELESS_PUBLIC_ORIGIN` names still work as fallback — see "Password-reset webhook" below |
 | `MAIL_CONTENT_ORIGIN` | (empty) | Separate origin serving HTML mail bodies (bare `https://host`, no path); empty = same-origin srcdoc frame |
+| `IRIS_ADMIN_EMAILS` | (empty) | Comma-separated emails allowed to see the read-only admin dashboard (`#/admin`); empty = nobody is an admin, every admin request answers 403 |
 
 ### Login CAPTCHA (Cloudflare Turnstile)
 

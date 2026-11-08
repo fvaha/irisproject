@@ -1,10 +1,11 @@
 import { SITE, footerLinks, initSite, setPage } from './site'
 
-type Summary = { id: string; from: string; to: string[]; subject: string; preview: string; received_at: string; is_read: boolean; is_draft?: boolean; has_attachment?: boolean }
+type Summary = { id: string; from: string; to: string[]; subject: string; preview: string; received_at: string; is_read: boolean; is_draft?: boolean; has_attachment?: boolean; is_starred?: boolean; labels?: string[]; thread_id?: string | null }
 type Attachment = { part_id: string; blob_id: string; name: string; content_type: string; size: number; disposition?: string | null }
 type MimePart = { part_id: string; content_type: string; name?: string | null; disposition?: string | null; size: number }
 type Detail = Summary & { text_body: string | null; html_body: string | null; cc?: string[]; message_id?: string | null; references?: string[]; attachments?: Attachment[]; mime_parts?: MimePart[]; body_source?: string }
-type TempInbox = { id: string; address: string; access_token: string; expires_at: string }
+type TempInbox = { id: string; address: string; access_token: string; expires_at: string; extensions_left?: number }
+type Contact = { id: string; name: string; email: string }
 
 const app = document.querySelector<HTMLDivElement>('#app')!
 
@@ -107,6 +108,7 @@ const errorText: Record<string, string> = {
 const tempErrors: Record<string, string> = {
   rate_limited: 'Too many addresses created from your network. Try again later.',
   quota_exceeded: 'You already have 3 active temporary addresses. Wait for one to expire.',
+  extension_limit_reached: 'This address cannot be extended any more.',
   network: errorText.network,
 }
 
@@ -528,8 +530,8 @@ function prefetchMessage(url: string, init?: RequestInit) {
 // Last message list per account, per tab (sessionStorage is cleared when the tab closes).
 //
 // Eviction rules: the stored list is only an initial paint -- load()
-// refetches it on render and every 30 s while the tab is visible -- so the
-// stored copy is bounded on both axes:
+// refetches it on render, on a stream notice, and every 30 s while the
+// live stream is down -- so the stored copy is bounded on both axes:
 // - TTL: entries older than LIST_CACHE_TTL_MS are ignored, so a reloaded
 //   tab shows a skeleton and fetches fresh instead of serving a stale list.
 //   A live tab never hits this: every successful poll rewrites the entry.
@@ -602,7 +604,7 @@ function mailShell(o: { topbar: HTMLElement; nav: HTMLElement[]; listTop: HTMLEl
 }
 
 /** Render message rows. Rows are buttons; an optional OTP copy button sits beside each row (never nested). */
-function fillList(list: HTMLElement, messages: Summary[], o: { current: string; empty: HTMLElement; compact?: boolean; showTo?: boolean; footer?: HTMLElement; onOpen: (m: Summary, index: number, wasUnread: boolean) => void; onIntent?: (m: Summary) => void }) {
+function fillList(list: HTMLElement, messages: Summary[], o: { current: string; empty: HTMLElement; compact?: boolean; showTo?: boolean; footer?: HTMLElement; onOpen: (m: Summary, index: number, wasUnread: boolean) => void; onIntent?: (m: Summary) => void; onStar?: (m: Summary) => void }) {
   if (!messages.length) return list.replaceChildren(o.empty)
   const prevList = list.querySelector('.message-list')
   const seen = new Set([...list.querySelectorAll<HTMLElement>('.msg-item')].map((li) => li.dataset.id))
@@ -615,7 +617,8 @@ function fillList(list: HTMLElement, messages: Summary[], o: { current: string; 
         ...(m.has_attachment ? [icon('clip', 'icon icon-sm msg-clip')] : [])),
       h('time', { className: 'msg-date', dateTime: m.received_at, title: fmtDate(m.received_at) }, fmtShort(m.received_at)),
       h('span', { className: 'msg-subject' }, m.subject || '(no subject)'),
-      ...(m.preview ? [h('span', { className: 'msg-preview' }, m.preview)] : []))
+      ...(m.preview ? [h('span', { className: 'msg-preview' }, m.preview)] : []),
+      ...(m.labels?.length ? [h('span', { className: 'msg-labels' }, ...m.labels.map((l) => h('span', { className: 'label-chip' }, icon('tag', 'icon icon-xs'), l)))] : []))
     if (m.id === o.current) row.setAttribute('aria-current', 'true')
     if (o.onIntent) { const intent = () => o.onIntent!(m); row.addEventListener('pointerenter', intent, { once: true }); row.addEventListener('focus', intent, { once: true }); row.addEventListener('touchstart', intent, { once: true, passive: true }) }
     row.onclick = () => {
@@ -632,6 +635,100 @@ function fillList(list: HTMLElement, messages: Summary[], o: { current: string; 
     li.style.setProperty('--i', String(Math.min(i, 12)))
     const code = o.compact ? `${m.subject} ${m.preview}`.match(/\b(\d{4,8})\b/)?.[1] : undefined
     if (code) li.append(copyButton(code, `Copy code ${code}`, 'otp-chip', code))
+    if (o.onStar) {
+      const label = m.is_starred ? 'Unstar' : 'Star'
+      li.append(h('button', { type: 'button', className: `star-btn${m.is_starred ? ' is-on' : ''}`, ariaLabel: `${label}: ${m.subject || '(no subject)'}`, title: label, 'aria-pressed': String(!!m.is_starred), onclick: () => o.onStar!(m) },
+        icon(m.is_starred ? 'star-fill' : 'star', 'icon icon-sm')))
+    }
+    return li
+  })), ...(o.footer ? [o.footer] : []))
+}
+
+/** One conversation in the list: all loaded messages sharing a threadId. */
+type ThreadGroup = { id: string; subject: string; participants: string[]; count: number; latest: Summary; unread: boolean; messages: Summary[] }
+type ThreadDetail = { thread_id: string; subject: string; messages: Detail[] }
+
+/** Group loaded summaries into conversations, newest thread first.
+ * Messages without a threadId are a thread of their own. Pure, so the
+ * grouping rule is the same everywhere the list is drawn. With `showTo`
+ * (Sent, Drafts) participants are the recipients, as in the flat list. */
+function groupThreads(messages: Summary[], showTo = false): ThreadGroup[] {
+  const byId = new Map<string, Summary[]>()
+  for (const m of messages) {
+    const key = m.thread_id ?? `msg:${m.id}`
+    const g = byId.get(key)
+    if (g) g.push(m)
+    else byId.set(key, [m])
+  }
+  const groups: ThreadGroup[] = []
+  for (const [id, ms] of byId) {
+    const sorted = [...ms].sort((a, b) => b.received_at.localeCompare(a.received_at))
+    const latest = sorted[0]
+    groups.push({
+      id,
+      subject: sorted.find((m) => m.subject.trim())?.subject ?? '',
+      participants: uniq(ms.flatMap((m) => showTo ? m.to.map(senderName) : [senderName(m.from)])),
+      count: ms.length,
+      latest,
+      unread: ms.some((m) => !m.is_read),
+      messages: ms,
+    })
+  }
+  return groups.sort((a, b) => b.latest.received_at.localeCompare(a.latest.received_at))
+}
+
+/** Render one row per conversation. Expanding a row shows its messages
+ * oldest first (the full thread when fetched, else the loaded page's
+ * slice) using the same rows as the flat list. */
+function fillThreadList(list: HTMLElement, groups: ThreadGroup[], o: {
+  current: string
+  empty: HTMLElement
+  footer?: HTMLElement
+  showTo?: boolean
+  expanded: Set<string>
+  threads: Map<string, ThreadDetail>
+  onToggle: (g: ThreadGroup) => void
+  onOpen: (m: Summary, index: number, wasUnread: boolean, total: number) => void
+  onIntent?: (m: Summary) => void
+  onStar?: (m: Summary) => void
+}) {
+  if (!groups.length) return list.replaceChildren(o.empty)
+  list.replaceChildren(h('ul', { className: 'message-list thread-list', ariaLabel: 'Conversations' }, ...groups.map((g) => {
+    const isOpen = o.expanded.has(g.id)
+    const countLabel = g.count === 1 ? '1 message' : `${g.count} messages`
+    const row = h('button', { type: 'button', className: `thread-row${g.unread ? ' unread' : ''}`, 'aria-expanded': String(isOpen), title: countLabel },
+      h('span', { className: 'msg-from' },
+        ...(g.unread ? [h('span', { className: 'iris-mark', title: 'Unread' }, h('span', { className: 'sr-only' }, 'Unread: '))] : []),
+        h('span', { className: 'msg-from-name' }, g.participants.join(', ') || '(unknown sender)'),
+        ...(g.count > 1 ? [h('span', { className: 'thread-count' }, String(g.count))] : [])),
+      h('time', { className: 'msg-date', dateTime: g.latest.received_at, title: fmtDate(g.latest.received_at) }, fmtShort(g.latest.received_at)),
+      h('span', { className: 'msg-subject' }, g.subject || '(no subject)'),
+      ...(g.latest.preview ? [h('span', { className: 'msg-preview' }, g.latest.preview)] : []))
+    row.onclick = () => o.onToggle(g)
+    const head = h('div', { className: 'thread-head' }, row)
+    if (o.onStar) {
+      const latest = g.latest
+      head.append(h('button', {
+        type: 'button', className: `star-btn${latest.is_starred ? ' is-on' : ''}`,
+        ariaLabel: `${latest.is_starred ? 'Unstar' : 'Star'}: ${g.subject || '(no subject)'}`, title: latest.is_starred ? 'Unstar' : 'Star',
+        'aria-pressed': String(!!latest.is_starred), onclick: () => o.onStar!(latest),
+      }, icon(latest.is_starred ? 'star-fill' : 'star', 'icon icon-sm')))
+    }
+    const li = h('li', { className: 'thread-item' }, head)
+    if (isOpen) {
+      const cached = o.threads.get(g.id)
+      const msgs = [...(cached?.messages ?? g.messages)].sort((a, b) => a.received_at.localeCompare(b.received_at))
+      const box = h('div', { className: 'thread-messages' })
+      fillList(box, msgs, {
+        current: o.current,
+        showTo: o.showTo,
+        empty: h('div'),
+        onOpen: (m, i, wasUnread) => o.onOpen(m, i, wasUnread, msgs.length),
+        ...(o.onIntent ? { onIntent: o.onIntent } : {}),
+        ...(o.onStar ? { onStar: o.onStar } : {}),
+      })
+      li.append(box)
+    }
     return li
   })), ...(o.footer ? [o.footer] : []))
 }
@@ -657,7 +754,11 @@ const matches = (m: Summary, q: string) => !q || `${m.from} ${m.subject} ${m.pre
 
 // ---------- Mailbox ----------
 type FolderRole = 'inbox' | 'sent' | 'drafts' | 'archive' | 'trash'
-type FolderInfo = { id: string; role: FolderRole; name: string; total: number; unread: number }
+type FolderInfo = { id: string; role: FolderRole | 'custom'; name: string; total: number; unread: number }
+/** What a mailbox page lists: a standard folder, a custom folder, Starred, or one label. */
+type MailView = { kind: 'role'; role: FolderRole } | { kind: 'folder'; id: string } | { kind: 'starred' } | { kind: 'label'; name: string }
+type MoveTarget = { folder: FolderRole } | { folder_id: string }
+type FilterRule = { id: string; field: 'from' | 'to' | 'subject'; value: string; action: 'move' | 'label' | 'star' | 'read'; target: string | null }
 const FOLDERS: { role: FolderRole; label: string; icon: string; empty: [string, string] }[] = [
   { role: 'inbox', label: 'Inbox', icon: 'inbox', empty: ['Your inbox is clear', 'New mail for this address will appear here.'] },
   { role: 'sent', label: 'Sent', icon: 'send', empty: ['Nothing sent yet', 'Messages you send appear here.'] },
@@ -668,8 +769,26 @@ const FOLDERS: { role: FolderRole; label: string; icon: string; empty: [string, 
 const folderHash = (r: FolderRole) => (r === 'inbox' ? '#/' : `#/${r}`)
 const folderMeta = (r: FolderRole) => FOLDERS.find((f) => f.role === r)!
 
-/** Signed-in account, kept while switching folders so each switch skips two requests. */
-let account: { email: string; mb: string } | null = null
+/** Custom folders and labels, kept across navigation so the sidebar draws at once. */
+let org: { folders: FolderInfo[]; labels: string[] } = { folders: [], labels: [] }
+const customFolders = () => org.folders.filter((f) => f.role === 'custom')
+const viewHash = (v: MailView) => v.kind === 'role' ? folderHash(v.role) : v.kind === 'starred' ? '#/starred'
+  : v.kind === 'folder' ? `#/folder/${encodeURIComponent(v.id)}` : `#/label/${encodeURIComponent(v.name)}`
+/** Key for the list cache and for marking the current nav item. */
+const viewKey = (v: MailView) => v.kind === 'role' ? v.role : v.kind === 'starred' ? 'starred' : v.kind === 'folder' ? `folder:${v.id}` : `label:${v.name}`
+const viewParams = (v: MailView): Record<string, string> => v.kind === 'role' ? { folder: v.role } : v.kind === 'starred' ? { view: 'starred' }
+  : v.kind === 'folder' ? { folder_id: v.id } : { label: v.name }
+function viewMeta(v: MailView): { label: string; icon: string; empty: [string, string] } {
+  switch (v.kind) {
+    case 'role': return folderMeta(v.role)
+    case 'starred': return { label: 'Starred', icon: 'star', empty: ['No starred mail', 'Star a message to find it here quickly.'] }
+    case 'folder': return { label: org.folders.find((f) => f.id === v.id)?.name ?? 'Folder', icon: 'folder', empty: ['This folder is empty', 'Move messages here to keep them together.'] }
+    case 'label': return { label: v.name, icon: 'tag', empty: ['No messages with this label', 'Open a message and choose Labels to add one.'] }
+  }
+}
+
+/** Signed-in account, kept while switching folders so each switch skips two requests. `is_admin` only decides whether the Admin nav link shows; the server gates the admin endpoints. */
+let account: { email: string; mb: string; is_admin: boolean } | null = null
 
 const sendErrors: Record<string, string> = {
   external_sending_disabled: 'Za sada se može slati samo na lokalne adrese.',
@@ -677,6 +796,7 @@ const sendErrors: Record<string, string> = {
   invalid_recipient: 'One of the addresses isn’t valid.',
   no_recipients: 'Add at least one recipient.',
   too_many_recipients: 'Too many recipients (50 max).',
+  invalid_attachment: 'One of the attachments isn’t valid — too large, too many, or a bad file name.',
   send_rejected: 'The mail server refused this message.',
   mail_server_error: 'The mail server returned an unexpected response. Try again shortly.',
   database_unavailable: 'Servis je privremeno nedostupan. Pokušaj ponovo za koji minut.',
@@ -721,8 +841,68 @@ function confirmDialog(title: string, text: string, confirmLabel: string): Promi
   })
 }
 
+/** Text-input dialog. `submit` returns an error to show, or null to close. Resolves true when submitted. */
+function promptDialog(o: { title: string; label: string; value?: string; confirm: string; hint?: string; submit: (v: string) => Promise<string | null> }): Promise<boolean> {
+  return new Promise((resolve) => {
+    const input = h('input', { id: 'prompt-input', type: 'text', value: o.value ?? '', autocomplete: 'off', spellcheck: false, 'aria-describedby': 'prompt-error' }) as HTMLInputElement
+    const err = h('p', { className: 'field-error', id: 'prompt-error', role: 'alert' })
+    const ok = h('button', { type: 'submit', className: 'btn btn-primary' }, h('span', { className: 'btn-label' }, o.confirm)) as HTMLButtonElement
+    const cancel = h('button', { type: 'button', className: 'btn btn-secondary' }, h('span', { className: 'btn-label' }, 'Cancel'))
+    const form = h('form', { className: 'prompt-form' },
+      h('div', { className: 'field' }, h('label', { htmlFor: 'prompt-input' }, o.label), input, ...(o.hint ? [h('p', { className: 'prompt-hint muted' }, o.hint)] : []), err),
+      h('div', { className: 'confirm-actions' }, cancel, ok))
+    const d = h('dialog', { className: 'confirm' }, h('h2', {}, o.title), form) as HTMLDialogElement
+    const done = (v: boolean) => { d.close(); d.remove(); resolve(v) }
+    form.onsubmit = async (e) => {
+      e.preventDefault()
+      const restore = busy(ok, 'Saving…')
+      const problem = await o.submit(input.value)
+      if (!problem) return done(true)
+      restore()
+      err.textContent = problem
+      input.setAttribute('aria-invalid', 'true')
+      input.focus()
+    }
+    input.oninput = () => { err.textContent = ''; input.removeAttribute('aria-invalid') }
+    cancel.onclick = () => done(false)
+    d.addEventListener('cancel', (e) => { e.preventDefault(); done(false) })
+    document.body.append(d)
+    d.showModal()
+    input.focus()
+    input.select()
+  })
+}
+
+/** List of one-click choices (e.g. Move to). */
+function choiceDialog(title: string, items: { label: string; icon: string; run: () => void }[], extra?: { label: string; run: () => void }) {
+  const d = h('dialog', { className: 'confirm' }) as HTMLDialogElement
+  const close = () => { if (d.open) d.close() }
+  const cancel = btn('btn btn-secondary', 'Cancel', undefined, { onclick: close })
+  d.append(h('h2', {}, title),
+    h('div', { className: 'choice-list' }, ...items.map((i) => h('button', { type: 'button', className: 'choice-item', onclick: () => { close(); i.run() } }, icon(i.icon, 'icon icon-sm'), h('span', {}, i.label)))),
+    h('div', { className: 'confirm-actions' }, ...(extra ? [btn('btn btn-ghost', extra.label, 'plus', { onclick: () => { close(); extra.run() } })] : []), cancel))
+  d.addEventListener('close', () => d.remove())
+  document.body.append(d)
+  d.showModal()
+  ;(d.querySelector('.choice-item') as HTMLElement | null ?? cancel).focus()
+}
+
 // ----- composer -----
-type ComposeDraft = { draftId?: string; to?: string[]; cc?: string[]; bcc?: string[]; subject?: string; text?: string; inReplyTo?: string | null; references?: string[]; title?: string }
+type ComposeAttachmentIn = { name: string; content_type: string; data: string; size: number }
+type ComposeDraft = { draftId?: string; to?: string[]; cc?: string[]; bcc?: string[]; subject?: string; text?: string; inReplyTo?: string | null; references?: string[]; title?: string; attachments?: ComposeAttachmentIn[] }
+const MAX_COMPOSE_FILES = 5
+const MAX_COMPOSE_FILE_BYTES = 5_000_000
+const MAX_COMPOSE_TOTAL_BYTES = 10_000_000
+
+/// ArrayBuffer to base64, chunked so a 5 MB file never blows the stack
+/// (String.fromCharCode.apply on the whole buffer would).
+function bufToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf)
+  let s = ''
+  const CHUNK = 0x8000
+  for (let i = 0; i < bytes.length; i += CHUNK) s += String.fromCharCode(...bytes.subarray(i, i + CHUNK))
+  return btoa(s)
+}
 const emailOf = (a: string) => (a.match(/<([^>]+)>/)?.[1] ?? a).trim().toLowerCase()
 const ADDRESS = /^[^\s@<>(),;:"[\]\\]+@[^\s@<>(),;:"[\]\\]+\.[^\s@<>(),;:"[\]\\]+$/
 const splitAddrs = (v: string) => v.split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean)
@@ -763,6 +943,86 @@ function replyDraft(d: Detail, kind: 'reply' | 'all' | 'forward', me: string): C
 
 let closeComposer: (() => Promise<void>) | null = null
 
+/** Contact autocomplete for one recipient field. Typing suggests matching
+ * contacts below the field; Arrow keys move, Enter or Tab picks, Escape
+ * closes. Picking replaces the address being typed, never the whole field. */
+function attachContactSuggest(f: { el: HTMLInputElement; row: HTMLDivElement }, onPick: () => void) {
+  // The browser's own email completion would fight this dropdown.
+  f.el.setAttribute('autocomplete', 'off')
+  const box = h('div', { className: 'compose-suggest', role: 'listbox', hidden: true })
+  f.row.append(box)
+  let items: Contact[] = []
+  let active = -1
+  let seq = 0
+  let timer = 0
+  const close = () => { box.hidden = true; items = []; active = -1 }
+  // The address being typed: the comma/semicolon-separated token around the caret.
+  const token = () => {
+    const v = f.el.value
+    const pos = f.el.selectionStart ?? v.length
+    const before = v.slice(0, pos)
+    const raw = Math.max(before.lastIndexOf(','), before.lastIndexOf(';')) + 1
+    const leading = v.slice(raw, pos).match(/^\s*/)?.[0].length ?? 0
+    const start = raw + leading
+    const after = v.slice(pos)
+    const next = after.search(/[,;]/)
+    const end = next === -1 ? v.length : pos + next
+    return { text: v.slice(start, end).trim(), start, end }
+  }
+  const render = () => {
+    box.replaceChildren(...items.map((c, i) => {
+      const b = h('button', { type: 'button', className: 'suggest-item', role: 'option', 'aria-selected': String(i === active) },
+        h('span', { className: 'suggest-name' }, c.name),
+        h('span', { className: 'suggest-email' }, c.email))
+      // mousedown (not click) so the input never blurs before the pick lands.
+      b.addEventListener('mousedown', (e) => { e.preventDefault(); pick(i) })
+      return b
+    }))
+    box.hidden = !items.length
+  }
+  const pick = (i: number) => {
+    const c = items[i]
+    if (!c) return
+    const { start, end } = token()
+    const v = f.el.value
+    const rest = v.slice(end).replace(/^[,;\s]*/, '')
+    f.el.value = v.slice(0, start) + c.email + ', ' + rest
+    const caret = start + c.email.length + 2
+    f.el.setSelectionRange(caret, caret)
+    close()
+    f.el.focus()
+    onPick()
+  }
+  f.el.addEventListener('input', () => {
+    clearTimeout(timer)
+    if (token().text.length < 2) { close(); return }
+    const my = ++seq
+    timer = window.setTimeout(async () => {
+      try {
+        const { contacts } = await api<{ contacts: Contact[] }>(`/api/v1/contacts?q=${encodeURIComponent(token().text)}&limit=8`)
+        if (my !== seq) return
+        items = contacts
+        active = -1
+        render()
+      } catch { if (my === seq) close() }
+    }, 200)
+  })
+  f.el.addEventListener('keydown', (e) => {
+    if (box.hidden) return
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault()
+      active = e.key === 'ArrowDown' ? (active + 1) % items.length : (active - 1 + items.length) % items.length
+      render()
+    } else if (e.key === 'Enter' || e.key === 'Tab') {
+      if (active >= 0) { e.preventDefault(); pick(active) }
+    } else if (e.key === 'Escape') {
+      // Stop here so the composer's own Escape handler does not close the panel.
+      e.preventDefault(); e.stopPropagation(); close()
+    }
+  })
+  f.el.addEventListener('blur', close)
+}
+
 async function openComposer(base: string, d: ComposeDraft, onChange: () => void) {
   if (closeComposer) await closeComposer()
   let draftId = d.draftId
@@ -790,6 +1050,57 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
   ccToggle.onclick = () => { cc.row.hidden = bcc.row.hidden = false; ccToggle.hidden = true; cc.el.focus() }
   to.row.append(ccToggle)
 
+  // Attachments: kept in memory as base64 (same shape the API validates),
+  // listed with name + size and a remove button. The file input is hidden
+  // inside its label so the whole button opens the picker.
+  let atts: ComposeAttachmentIn[] = [...(d.attachments ?? [])]
+  const attachList = h('div', { className: 'compose-attach-list' })
+  const fileInput = h('input', { type: 'file', multiple: true, ariaLabel: 'Choose files to attach' }) as HTMLInputElement
+  const attachBtn = h('label', { className: 'btn btn-secondary btn-sm' }, 'Attach files', fileInput)
+  const attachBox = h('div', { className: 'compose-attach' }, attachBtn, attachList)
+  const renderAtts = () => {
+    attachList.replaceChildren(...atts.map((a, i) => h('div', { className: 'attach-row' },
+      h('div', { className: 'attach-meta' }, h('strong', {}, a.name), h('span', {}, `${a.content_type} · ${fmtBytes(a.size)}`)),
+      h('div', { className: 'attach-actions' },
+        btn('btn btn-ghost btn-sm', 'Remove', undefined, { onclick: () => { atts.splice(i, 1); renderAtts(); changed() } })))))
+  }
+  renderAtts()
+  fileInput.onchange = async () => {
+    const files = [...(fileInput.files ?? [])]
+    fileInput.value = ''
+    if (!files.length) return
+    error.replaceChildren()
+    let used = atts.reduce((n, a) => n + a.size, 0)
+    for (const f of files) {
+      if (atts.length >= MAX_COMPOSE_FILES) {
+        error.replaceChildren(icon('alert'), h('span', {}, `At most ${MAX_COMPOSE_FILES} attachments.`))
+        break
+      }
+      if (f.size > MAX_COMPOSE_FILE_BYTES) {
+        error.replaceChildren(icon('alert'), h('span', {}, `“${f.name}” is over the 5 MB limit.`))
+        continue
+      }
+      if (used + f.size > MAX_COMPOSE_TOTAL_BYTES) {
+        error.replaceChildren(icon('alert'), h('span', {}, 'Attachments total over the 10 MB limit.'))
+        continue
+      }
+      const data = await new Promise<string>((resolve) => {
+        const r = new FileReader()
+        r.onload = () => resolve(String(r.result).split(',')[1] ?? '')
+        r.onerror = () => resolve('')
+        r.readAsDataURL(f)
+      })
+      if (!data) {
+        error.replaceChildren(icon('alert'), h('span', {}, `Could not read “${f.name}”.`))
+        continue
+      }
+      atts.push({ name: f.name, content_type: f.type || 'application/octet-stream', data, size: f.size })
+      used += f.size
+    }
+    renderAtts()
+    changed()
+  }
+
   const status = h('span', { className: 'compose-status', 'aria-live': 'polite' })
   const error = h('div', { className: 'form-error', role: 'alert' })
   const send = h('button', { type: 'button', className: 'btn btn-primary' }, icon('send'), h('span', { className: 'btn-label' }, 'Send')) as HTMLButtonElement
@@ -798,6 +1109,7 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
   const panel = h('section', { className: 'composer', role: 'dialog', ariaLabel: d.title ?? 'New message' },
     h('header', { className: 'composer-head' }, h('h2', {}, d.title ?? 'New message'), status, closeBtn),
     h('div', { className: 'composer-fields' }, to.row, to.err, cc.row, cc.err, bcc.row, bcc.err, subject.row),
+    attachBox,
     body,
     error,
     h('footer', { className: 'composer-foot' }, send, h('span', { className: 'compose-hint' }, 'Ctrl + Enter to send'), discard))
@@ -806,8 +1118,9 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
     to: splitAddrs(to.el.value), cc: splitAddrs(cc.el.value), bcc: splitAddrs(bcc.el.value),
     subject: subject.el.value.replace(/[\r\n]+/g, ' '), text: body.value,
     in_reply_to: d.inReplyTo ?? null, references: d.references ?? [], draft_id: draftId ?? null,
+    attachments: atts.map(({ name, content_type, data }) => ({ name, content_type, data })),
   })
-  const isEmpty = () => !to.el.value.trim() && !cc.el.value.trim() && !bcc.el.value.trim() && !subject.el.value.trim() && !body.value.trim()
+  const isEmpty = () => !to.el.value.trim() && !cc.el.value.trim() && !bcc.el.value.trim() && !subject.el.value.trim() && !body.value.trim() && !atts.length
 
   const save = async () => {
     clearTimeout(timer)
@@ -827,6 +1140,7 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
   const changed = () => { dirty = true; status.textContent = ''; clearTimeout(timer); timer = window.setTimeout(save, 2500) }
   ;[to.el, cc.el, bcc.el, subject.el, body].forEach((el) => el.addEventListener('input', changed))
   ;[to, cc, bcc].forEach((f) => f.el.addEventListener('input', () => f.set('')))
+  ;[to, cc, bcc].forEach((f) => attachContactSuggest(f, changed))
 
   const close = async () => {
     if (closed) return
@@ -896,30 +1210,129 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
 }
 
 // ----- mailbox view -----
-async function renderMailbox(folder: FolderRole = 'inbox') {
+async function ensureAccount() {
   if (!account) {
     const [session, { mailboxes }] = await Promise.all([
-      api<{ email: string }>('/api/v1/session'),
+      api<{ email: string; is_admin?: boolean }>('/api/v1/session'),
       api<{ mailboxes: { id: string }[] }>('/api/v1/mailboxes'),
     ])
-    account = { email: session.email, mb: mailboxes[0]?.id ?? '' }
+    account = { email: session.email, mb: mailboxes[0]?.id ?? '', is_admin: session.is_admin === true }
   }
-  const { email, mb } = account
-  const meta = folderMeta(folder)
+  return account
+}
+
+/** Refreshes `org` (folders with counts + labels). Returns the folder list. */
+async function loadOrg(base: string) {
+  const [{ folders }, { labels }] = await Promise.all([
+    api<{ folders: FolderInfo[] }>(`${base}/folders`),
+    api<{ labels: { name: string }[] }>(`${base}/labels`),
+  ])
+  org = { folders, labels: labels.map((l) => l.name) }
+  return folders
+}
+
+/** Sidebar links (and mobile tabs) for Starred, custom folders, labels and Organize. */
+function orgNav(current: string) {
+  const link = (href: string, ic: string, label: string, key: string, count?: number) => {
+    const a = navItem(href, ic, label, key === current, count ? h('span', { className: 'nav-count' }, String(count)) : undefined)
+    a.classList.add('nav-folder')
+    return a
+  }
+  const tab = (href: string, label: string, key: string) =>
+    h('a', { href, className: 'folder-tab', ...(key === current ? { 'aria-current': 'page' } : {}) }, label)
+  const sidebar = h('div', { className: 'nav-group' })
+  const tabs = h('div', { className: 'nav-group' })
+  let drawn = ''
+  const draw = () => {
+    const custom = customFolders()
+    const sig = JSON.stringify([custom.map((f) => [f.id, f.name, f.unread]), org.labels])
+    if (sig === drawn) return
+    drawn = sig
+    sidebar.replaceChildren(
+      ...(custom.length ? [navSection('Folders')] : []),
+      ...custom.map((f) => link(viewHash({ kind: 'folder', id: f.id }), 'folder', f.name, `folder:${f.id}`, f.unread)),
+      ...(org.labels.length ? [navSection('Labels')] : []),
+      ...org.labels.map((l) => link(viewHash({ kind: 'label', name: l }), 'tag', l, `label:${l}`)),
+      link('#/organize', 'filter', 'Organize', 'organize'))
+    tabs.replaceChildren(
+      tab('#/starred', 'Starred', 'starred'),
+      ...custom.map((f) => tab(viewHash({ kind: 'folder', id: f.id }), f.name, `folder:${f.id}`)),
+      ...org.labels.map((l) => tab(viewHash({ kind: 'label', name: l }), `# ${l}`, `label:${l}`)),
+      tab('#/organize', 'Organize', 'organize'))
+  }
+  draw()
+  return { starred: link('#/starred', 'star', 'Starred', 'starred'), sidebar, tabs, draw }
+}
+
+const orgErrors: Record<string, string> = {
+  invalid_label: 'Use 1–32 lowercase letters, numbers, “-” or “_”.',
+  too_many_labels: 'You’ve reached the limit of 50 labels.',
+  invalid_folder_name: 'Use 1–64 characters, no “/”, and not a built-in folder name.',
+  folder_exists: 'A folder with this name already exists.',
+  too_many_folders: 'You’ve reached the limit of 50 folders.',
+  folder_not_empty: 'This folder still has messages. Move or delete them first.',
+  folder_in_use_by_filter: 'A filter moves mail into this folder. Delete that filter first.',
+  label_in_use_by_filter: 'A filter adds this label. Delete that filter first.',
+  invalid_filter: 'Choose what to match and enter the text to look for.',
+  too_many_filters: 'You’ve reached the limit of 50 filters.',
+  unknown_label: 'That label no longer exists. Reload the page and try again.',
+  invalid_folder: 'That folder can’t be used here.',
+  invalid_contact_name: 'Use a name of 1–100 characters.',
+  invalid_contact_email: 'Enter a valid email address.',
+  contact_exists: 'A contact with this email already exists.',
+  too_many_contacts: 'You’ve reached the limit of 500 contacts.',
+  not_found: 'It no longer exists. Reload the page and try again.',
+  mail_server_unavailable: errorText.mail_server_unavailable,
+  mail_server_error: errorText.mail_server_error,
+  network: errorText.network,
+}
+const orgError = (err: unknown) => orgErrors[(err as HttpError).code] ?? 'Something went wrong. Try again.'
+const labelName = (v: string) => v.trim().toLowerCase().replace(/\s+/g, '-')
+
+const newLabelDialog = (base: string) => promptDialog({
+  title: 'New label', label: 'Label name', confirm: 'Create label', hint: 'Lowercase letters, numbers, “-” and “_”. Up to 32 characters.',
+  submit: async (v) => {
+    try {
+      const { label } = await api<{ label: { name: string } }>(`${base}/labels`, { method: 'POST', body: JSON.stringify({ name: labelName(v) }) })
+      org.labels = uniq([...org.labels, label.name]).sort()
+      return null
+    } catch (err) { return orgError(err) }
+  },
+})
+const newFolderDialog = (base: string) => promptDialog({
+  title: 'New folder', label: 'Folder name', confirm: 'Create folder',
+  submit: async (v) => {
+    try {
+      const { folder } = await api<{ folder: FolderInfo }>(`${base}/folders`, { method: 'POST', body: JSON.stringify({ name: v }) })
+      org.folders = [...org.folders, folder]
+      return null
+    } catch (err) { return orgError(err) }
+  },
+})
+
+async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
+  const { email, mb, is_admin } = await ensureAccount()
+  const folder = view.kind === 'role' ? view.role : null
+  const key = viewKey(view)
+  let meta = viewMeta(view)
   const base = `/api/v1/mailboxes/${mb}`
   setPage({ title: meta.label, description: `Tvoj vahid.im ${meta.label.toLowerCase()}.`, path: '/', noindex: true })
 
-  let all: Summary[] = (mb && readListCache(email, mb, folder)) || []
+  let all: Summary[] = (mb && readListCache(email, mb, key)) || []
   let query = ''
   let current = ''
-  /** Server-side total for the current folder/search; `all` is only page 1 until load-more appends. */
+  /** Server-side total for the current view/search; `all` is only page 1 until load-more appends. */
   let total = 0
   /** The query `all` was last fetched with. While it differs from `query`, draw() falls back to the local matches() filter (cached list / search in flight). */
   let loadedQuery = ''
   let loadingMore = false
   let searchTimer: number | undefined
+  /** True while the live stream is connected: the 30 s poll stands down. */
+  let streamLive = false
+  /** New arrivals the stream has reported since the last list load. */
+  let pendingNew = 0
 
-  const signOut = () => { clearMailCache(); account = null; closeComposer?.() }
+  const signOut = () => { mailStream?.close(); mailStream = null; clearMailCache(); account = null; org = { folders: [], labels: [] }; closeComposer?.() }
   const logout = btn('btn btn-ghost btn-icon-sm', 'Sign out', 'logout')
   logout.onclick = async () => { busy(logout, ''); signOut(); await api('/auth/logout', { method: 'POST' }).catch(() => {}); location.hash = '#/signed-out' }
   const refresh = btn('btn btn-ghost btn-icon-sm', 'Refresh', 'refresh')
@@ -927,6 +1340,8 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
   const unreadChip = h('span', { className: 'pane-chip', hidden: true })
   const counts = new Map(FOLDERS.map((f) => [f.role, h('span', { className: 'nav-count' })]))
   const tabCounts = new Map(FOLDERS.map((f) => [f.role, h('span', { className: 'tab-count' })]))
+  const title = h('h2', { className: 'pane-title' }, meta.label)
+  const nav = orgNav(key)
 
   const compose = (d: ComposeDraft = {}) => { if (mb) openComposer(base, d, onMutate) }
   const composeBtn = btn('btn btn-primary compose-btn', 'Compose', 'pen', { onclick: () => compose() })
@@ -945,7 +1360,7 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
       logout))
 
   const folderTabs = h('nav', { className: 'folder-tabs', ariaLabel: 'Folders' }, ...FOLDERS.map((f) =>
-    h('a', { href: folderHash(f.role), className: 'folder-tab', ...(f.role === folder ? { 'aria-current': 'page' } : {}) }, f.label, tabCounts.get(f.role)!)))
+    h('a', { href: folderHash(f.role), className: 'folder-tab', ...(f.role === folder ? { 'aria-current': 'page' } : {}) }, f.label, tabCounts.get(f.role)!)), nav.tabs)
 
   const idle = () => emptyState('mail', 'No message selected', 'Choose a message from the list to read it here.')
   const ui = mailShell({
@@ -958,10 +1373,16 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
         a.classList.add('nav-folder')
         return a
       }),
-      h('a', { href: folderHash(folder), className: 'nav-item nav-mail', 'aria-current': 'page' }, icon('mail'), h('span', { className: 'nav-label' }, 'Mail')),
+      nav.starred,
+      nav.sidebar,
+      navItem('#/dmarc', 'shield', 'DMARC reports'),
+      h('a', { href: viewHash(view), className: 'nav-item nav-mail', 'aria-current': 'page' }, icon('mail'), h('span', { className: 'nav-label' }, 'Mail')),
+      navSection('Temporary'),
+      navItem('#/temp', 'timer', 'Temporary inbox'),
+      ...(is_admin ? [navSection('Admin'), navItem('#/admin', 'account', 'Admin')] : []),
       footerLinks('sidebar-footer'),
     ],
-    listTop: [h('header', { className: 'pane-head' }, h('h2', { className: 'pane-title' }, meta.label), unreadChip, refresh), folderTabs],
+    listTop: [h('header', { className: 'pane-head' }, title, unreadChip, refresh), folderTabs],
     listBottom: fab,
     idle: idle(),
   })
@@ -971,38 +1392,112 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
   const loadFolders = async () => {
     if (!mb) return
     try {
-      const { folders } = await api<{ folders: FolderInfo[] }>(`${base}/folders`)
+      const folders = await loadOrg(base)
       for (const f of folders) {
         const n = f.role === 'inbox' ? f.unread : f.role === 'drafts' ? f.total : 0
-        counts.get(f.role)!.textContent = n ? String(n) : ''
-        tabCounts.get(f.role)!.textContent = n ? String(n) : ''
+        const c = counts.get(f.role as FolderRole)
+        if (!c) continue
+        c.textContent = n ? String(n) : ''
+        tabCounts.get(f.role as FolderRole)!.textContent = n ? String(n) : ''
       }
+      nav.draw()
+      if (view.kind === 'folder') { meta = viewMeta(view); title.textContent = meta.label; setPage({ title: meta.label, description: 'Your IRIS folder.', path: '/', noindex: true }) }
     } catch { /* counts are optional */ }
   }
 
   const removeLocal = (id: string) => {
     all = all.filter((m) => m.id !== id)
-    writeListCache(email, mb, folder, all)
+    writeListCache(email, mb, key, all)
     if (current === id) { current = ''; ui.hide(idle()) }
     draw()
   }
+  const keepLocal = () => { writeListCache(email, mb, key, all); draw() }
 
-  const move = async (m: Summary, target: FolderRole) => {
-    removeLocal(m.id)
+  /** Where messages in this view live, for Undo. Starred/label views span folders, so they have none. */
+  const here: MoveTarget | null = view.kind === 'role' ? { folder: view.role } : view.kind === 'folder' ? { folder_id: view.id } : null
+  const targetName = (t: MoveTarget) => 'folder' in t ? folderMeta(t.folder).label : org.folders.find((f) => f.id === t.folder_id)?.name ?? 'folder'
+
+  const move = async (m: Summary, target: MoveTarget) => {
+    const toTrash = 'folder' in target && target.folder === 'trash'
+    // Starred and label views show mail from every folder except Trash.
+    if (here || toTrash) removeLocal(m.id)
     messageCache.delete(url(m.id)) // the body is no longer in this folder; refetch if it comes back (undo)
     try {
-      await api(`${url(m.id)}/move`, { method: 'POST', body: JSON.stringify({ folder: target }) })
-      toast(target === 'trash' ? 'Moved to Trash' : `Moved to ${folderMeta(target).label}`, {
+      await api(`${url(m.id)}/move`, { method: 'POST', body: JSON.stringify(target) })
+      toast(toTrash ? 'Moved to Trash' : `Moved to ${targetName(target)}`, here ? {
         label: 'Undo',
         run: async () => {
-          await api(`${url(m.id)}/move`, { method: 'POST', body: JSON.stringify({ folder }) }).catch(() => toast('Could not undo.'))
+          await api(`${url(m.id)}/move`, { method: 'POST', body: JSON.stringify(here) }).catch(() => toast('Could not undo.'))
           load(); loadFolders()
         },
-      })
+      } : undefined)
       loadFolders()
     } catch {
       toast('Could not move the message.'); load()
     }
+  }
+
+  const moveDialog = (m: Summary) => {
+    type Item = { label: string; icon: string; target: MoveTarget }
+    const fixed: Item[] = [
+      { label: 'Inbox', icon: 'inbox', target: { folder: 'inbox' } },
+      { label: 'Archive', icon: 'archive', target: { folder: 'archive' } },
+    ]
+    const items = [
+      ...fixed,
+      ...customFolders().map((f): Item => ({ label: f.name, icon: 'folder', target: { folder_id: f.id } })),
+    ].filter((i) => JSON.stringify(i.target) !== JSON.stringify(here))
+    choiceDialog('Move to', items.map((i) => ({ label: i.label, icon: i.icon, run: () => move(m, i.target) })),
+      { label: 'New folder', run: async () => { if (await newFolderDialog(base)) { nav.draw(); moveDialog(m) } } })
+  }
+
+  const toggleStar = async (m: Summary) => {
+    const on = !m.is_starred
+    m.is_starred = on
+    if (view.kind === 'starred' && !on) removeLocal(m.id)
+    else keepLocal()
+    try {
+      await api(`${url(m.id)}/star`, { method: 'POST', body: JSON.stringify({ starred: on }) })
+    } catch {
+      m.is_starred = !on
+      toast('Could not update the star.')
+      load()
+    }
+  }
+
+  const setLabel = async (m: Summary, label: string, on: boolean) => {
+    try {
+      await api(`${url(m.id)}/labels`, { method: 'POST', body: JSON.stringify({ label, on }) })
+    } catch (err) { toast(orgError(err)); return false }
+    m.labels = on ? uniq([...(m.labels ?? []), label]).sort() : (m.labels ?? []).filter((l) => l !== label)
+    if (view.kind === 'label' && view.name === label && !on) removeLocal(m.id)
+    else keepLocal()
+    return true
+  }
+
+  const labelsDialog = (m: Summary) => {
+    const list = h('div', { className: 'choice-list' })
+    const render = () => list.replaceChildren(...(org.labels.length
+      ? org.labels.map((l) => {
+        const cb = h('input', { type: 'checkbox', checked: !!m.labels?.includes(l) }) as HTMLInputElement
+        cb.onchange = async () => {
+          cb.disabled = true
+          if (!(await setLabel(m, l, cb.checked))) cb.checked = !cb.checked
+          cb.disabled = false
+        }
+        return h('label', { className: 'choice-item choice-check' }, cb, icon('tag', 'icon icon-sm'), h('span', {}, l))
+      })
+      : [h('p', { className: 'muted' }, 'No labels yet. Create one to start sorting mail.')]))
+    render()
+    const done = btn('btn btn-primary', 'Done')
+    const create = btn('btn btn-secondary', 'New label', 'plus')
+    const d = h('dialog', { className: 'confirm' }, h('h2', {}, 'Labels'), list, h('div', { className: 'confirm-actions' }, create, done)) as HTMLDialogElement
+    create.onclick = async () => { if (await newLabelDialog(base)) { render(); nav.draw() } }
+    done.onclick = () => d.close()
+    d.addEventListener('close', () => d.remove())
+    document.body.append(d)
+    d.showModal()
+    done.focus()
   }
 
   const deleteForever = async (m: Summary) => {
@@ -1032,22 +1527,41 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
     }
     const icons: HTMLElement[] = []
     const ib = (label: string, ic: string, run: () => void) => btn('btn btn-ghost btn-icon-sm', label, ic, { onclick: run })
-    if (folder === 'inbox') icons.push(ib('Archive', 'archive', () => move(m, 'archive')))
-    if (folder === 'archive') icons.push(ib('Move to Inbox', 'inbox', () => move(m, 'inbox')))
+    const star = (): HTMLElement => {
+      const s = ib(m.is_starred ? 'Unstar' : 'Star', m.is_starred ? 'star-fill' : 'star', () => { void toggleStar(m); s.replaceWith(star()) })
+      s.classList.toggle('is-starred', !!m.is_starred)
+      s.setAttribute('aria-pressed', String(!!m.is_starred))
+      return s
+    }
+    icons.push(star(), ib('Labels', 'tag', () => labelsDialog(m)))
+    if (folder === 'inbox') icons.push(ib('Archive', 'archive', () => move(m, { folder: 'archive' })))
+    if (folder === 'archive' || view.kind === 'folder') icons.push(ib('Move to Inbox', 'inbox', () => move(m, { folder: 'inbox' })))
+    if (folder !== 'trash' && folder !== 'drafts') icons.push(ib('Move to…', 'folder', () => moveDialog(m)))
     if (folder === 'trash') {
-      actions.push(b('Restore to Inbox', 'inbox', () => move(m, 'inbox')))
+      actions.push(b('Restore to Inbox', 'inbox', () => move(m, { folder: 'inbox' })))
       actions.push(b('Delete forever', 'trash', () => deleteForever(m), 'btn btn-danger btn-sm'))
     } else {
-      icons.push(ib('Delete', 'trash', () => move(m, 'trash')))
+      icons.push(ib('Delete', 'trash', () => move(m, { folder: 'trash' })))
     }
-    if (folder === 'inbox' || folder === 'archive') icons.push(ib('Mark as unread', 'mail', () => markUnread(m)))
+    if (folder !== 'trash' && folder !== 'sent' && folder !== 'drafts') icons.push(ib('Mark as unread', 'mail', () => markUnread(m)))
     return h('div', { className: 'reader-toolbar' }, h('div', { className: 'reader-actions' }, ...actions), h('div', { className: 'reader-icons' }, ...icons))
   }
 
   const openDraft = async (m: Summary) => {
     try {
       const { message: d } = await api<{ message: Detail }>(url(m.id))
-      compose({ title: 'Draft', draftId: m.id, to: d.to.map(emailOf), cc: (d.cc ?? []).map(emailOf), subject: d.subject, text: d.text_body ?? '' })
+      // A draft's attachments must come along: the next autosave replaces
+      // the draft, so opening it without them would silently drop them.
+      // If a download fails, don't open the draft at all — the files stay
+      // safe in Drafts until the user retries.
+      const attachments: ComposeAttachmentIn[] = []
+      for (const a of d.attachments ?? []) {
+        const res = await fetch(`${url(m.id)}/attachments/${encodeURIComponent(a.part_id)}`, { credentials: 'same-origin' })
+        if (!res.ok) throw new Error('attachment download failed')
+        const buf = await res.arrayBuffer()
+        attachments.push({ name: a.name, content_type: a.content_type, data: bufToBase64(buf), size: buf.byteLength })
+      }
+      compose({ title: 'Draft', draftId: m.id, to: d.to.map(emailOf), cc: (d.cc ?? []).map(emailOf), subject: d.subject, text: d.text_body ?? '', attachments })
     } catch { toast('Could not open the draft.') }
   }
 
@@ -1058,6 +1572,47 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
       btn('btn btn-secondary btn-sm', loadingMore ? 'Loading…' : 'Load more', undefined, { disabled: loadingMore, onclick: () => { void loadMore() } }))
   }
 
+  /** Opened threads and their fetched details, kept across redraws. */
+  const expandedThreads = new Set<string>()
+  const threadDetails = new Map<string, ThreadDetail>()
+
+  const openFromList = (m: Summary, i: number, wasUnread: boolean, total: number) => {
+    if (folder === 'drafts' || m.is_draft) return void openDraft(m)
+    if (wasUnread) {
+      writeListCache(email, mb, key, all)
+      api(`${url(m.id)}/seen`, { method: 'POST', body: JSON.stringify({ seen: true }) }).then(loadFolders, () => {})
+    }
+    current = m.id
+    draw()
+    ui.show()
+    openMessageAt(url(m.id), ui.readerBody, undefined, () => { signOut(); renderLogin() }, `${i + 1} of ${total}`, toolbar(m), htmlBodyMinter(url(m.id)))
+  }
+
+  const toggleThread = (g: ThreadGroup) => {
+    if (expandedThreads.has(g.id)) { expandedThreads.delete(g.id); draw(); return }
+    expandedThreads.add(g.id)
+    draw()
+    // A one-message thread needs no fetch: the loaded summary is the
+    // whole conversation. Larger threads fetch once and cache.
+    if (g.count > 1 && !threadDetails.has(g.id) && !g.id.startsWith('msg:')) {
+      api<{ thread: ThreadDetail }>(`${base}/threads/${encodeURIComponent(g.id)}`)
+        .then(({ thread }) => {
+          threadDetails.set(g.id, thread)
+          // Seed the message cache so opening a message in the thread
+          // needs no second fetch.
+          for (const d of thread.messages) {
+            const u = url(d.id)
+            if (!messageCache.has(u)) {
+              while (messageCache.size >= MESSAGE_CACHE_MAX) messageCache.delete(messageCache.keys().next().value!)
+              messageCache.set(u, { at: Date.now(), p: Promise.resolve({ message: d }) })
+            }
+          }
+          draw()
+        })
+        .catch(() => { toast('Could not load this conversation.') })
+    }
+  }
+
   const draw = () => {
     // When the loaded list already matches the query (server-side search),
     // show it as-is: a body-only hit would fail the local from/subject/preview filter.
@@ -1065,25 +1620,25 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
     const unread = all.filter((m) => !m.is_read).length
     unreadChip.textContent = `${unread} unread`
     unreadChip.hidden = folder !== 'inbox' || !unread
-    const [title, text] = meta.empty
-    fillList(ui.list, shown, {
+    const [emptyTitle, emptyText] = meta.empty
+    fillThreadList(ui.list, groupThreads(shown, folder === 'sent' || folder === 'drafts'), {
       current,
       showTo: folder === 'sent' || folder === 'drafts',
-      empty: query ? emptyState('search', 'No matches', `Nothing in ${meta.label} matches “${query}”.`) : emptyState(meta.icon, title, text),
+      empty: query ? emptyState('search', 'No matches', `Nothing in ${meta.label} matches “${query}”.`) : emptyState(meta.icon, emptyTitle, emptyText),
       footer: loadMoreFooter(),
-      onOpen: (m, i, wasUnread) => {
-        if (folder === 'drafts') return void openDraft(m)
-        if (wasUnread) {
-          writeListCache(email, mb, folder, all)
-          api(`${url(m.id)}/seen`, { method: 'POST', body: JSON.stringify({ seen: true }) }).then(loadFolders, () => {})
-        }
-        current = m.id
-        draw()
-        ui.show()
-        openMessageAt(url(m.id), ui.readerBody, undefined, () => { signOut(); renderLogin() }, `${i + 1} of ${shown.length}`, toolbar(m), htmlBodyMinter(url(m.id)))
-      },
+      expanded: expandedThreads,
+      threads: threadDetails,
+      onToggle: (g) => { toggleThread(g) },
+      onOpen: (m, i, wasUnread, total) => openFromList(m, i, wasUnread, total),
+      onStar: folder === 'drafts' ? undefined : (m) => { void toggleStar(m) },
       onIntent: folder === 'drafts' ? undefined : (m) => prefetchMessage(url(m.id)),
     })
+  }
+
+  const params = (extra: Record<string, string> = {}) => {
+    const p = new URLSearchParams({ ...viewParams(view), limit: '50', ...extra })
+    if (query) p.set('q', query)
+    return p
   }
 
   const load = async () => {
@@ -1092,18 +1647,21 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
     const restore = busy(refresh, '')
     refresh.classList.add('is-spinning')
     try {
-      const params = new URLSearchParams({ folder, limit: '50' })
-      if (query) params.set('q', query)
-      const { messages: fresh, total: t } = await api<{ messages: Summary[]; total: number }>(`${base}/messages?${params}`)
+      const { messages: fresh, total: t } = await api<{ messages: Summary[]; total: number }>(`${base}/messages?${params()}`)
       const read = new Set(all.filter((m) => m.is_read).map((m) => m.id))
       all = fresh.map((m) => ({ ...m, is_read: m.is_read || read.has(m.id) }))
       total = t
       loadedQuery = query
-      writeListCache(email, mb, folder, all)
+      writeListCache(email, mb, key, all)
+      pendingNew = 0 // the list is fresh, so nothing is pending anymore
       synced.textContent = `Synced ${fmtTime(new Date())}`
       draw()
     } catch (err) {
       if ((err as HttpError).status === 401) { signOut(); return renderLogin() }
+      if ((err as HttpError).status === 404 && view.kind === 'folder') {
+        ui.list.replaceChildren(emptyState('folder', 'Folder not found', 'This folder was deleted or renamed elsewhere.'))
+        return
+      }
       if (all.length) { synced.textContent = 'Offline · showing saved list'; return }
       ui.list.replaceChildren(errorState(errorText[(err as HttpError).code] ?? 'Could not load messages.', load))
     } finally { restore(); refresh.classList.remove('is-spinning') }
@@ -1113,9 +1671,7 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
     loadingMore = true
     draw()
     try {
-      const params = new URLSearchParams({ folder, limit: '50', position: String(all.length) })
-      if (query) params.set('q', query)
-      const { messages, total: t } = await api<{ messages: Summary[]; total: number }>(`${base}/messages?${params}`)
+      const { messages, total: t } = await api<{ messages: Summary[]; total: number }>(`${base}/messages?${params({ position: String(all.length) })}`)
       total = t
       const seen = new Set(all.map((m) => m.id))
       const read = new Set(all.filter((m) => m.is_read).map((m) => m.id))
@@ -1124,7 +1680,7 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
         ...messages.filter((m) => !seen.has(m.id)).map((m) => ({ ...m, is_read: m.is_read || read.has(m.id) })),
       ]
       loadedQuery = query
-      writeListCache(email, mb, folder, all)
+      writeListCache(email, mb, key, all)
     } catch {
       toast('Could not load more messages.')
     } finally {
@@ -1142,16 +1698,427 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
 
   refresh.onclick = () => { load(); loadFolders() }
   loadFolders()
-  // New mail shows up on its own while the tab is visible.
-  tempTimers.push(window.setInterval(() => { if (!document.hidden) { load(); loadFolders() } }, 30_000))
+  // Live new-mail stream: one EventSource per mailbox view, shared
+  // server-side with every other tab on the same mailbox. While it is
+  // live the 30 s poll below stands down; when it drops (error, or a
+  // reconnect after a network blip) the poll resumes and the stream
+  // reconnects on its own. New arrivals surface as a notice with a
+  // Show action instead of yanking the list mid-read.
+  const openStream = () => {
+    mailStream?.close()
+    const es = new EventSource(`${base}/events`)
+    mailStream = es
+    es.addEventListener('hello', () => { streamLive = true })
+    es.addEventListener('new-mail', (ev) => {
+      const data = JSON.parse((ev as MessageEvent).data) as { new: number; total: number }
+      pendingNew += data.new
+      toast(pendingNew === 1 ? '1 new message' : `${pendingNew} new messages`, { label: 'Show', run: () => {
+        pendingNew = 0
+        if (folder === 'inbox') { load(); loadFolders() } else { location.hash = '#/' }
+      } })
+    })
+    es.onerror = () => { streamLive = false }
+  }
+  openStream()
+  // Fallback while the stream is down: the old 30 s poll.
+  tempTimers.push(window.setInterval(() => { if (!document.hidden && !streamLive) { load(); loadFolders() } }, 30_000))
   if (all.length) { draw(); load() } else await load()
+}
+
+// ----- folders, labels & filters page -----
+const FILTER_FIELDS: [FilterRule['field'], string][] = [['from', 'From'], ['to', 'To or Cc'], ['subject', 'Subject']]
+const FILTER_ACTIONS: [FilterRule['action'], string][] = [['move', 'Move to folder'], ['label', 'Add label'], ['star', 'Star it'], ['read', 'Mark as read']]
+
+function describeFilter(f: FilterRule) {
+  const field = FILTER_FIELDS.find(([k]) => k === f.field)?.[1] ?? f.field
+  const then = f.action === 'move' ? `move to ${org.folders.find((x) => x.id === f.target)?.name ?? 'a deleted folder'}`
+    : f.action === 'label' ? `add label “${f.target}”` : f.action === 'star' ? 'star it' : 'mark as read'
+  return `If ${field} contains “${f.value}”, ${then}`
+}
+
+async function renderOrganize() {
+  const { email, mb } = await ensureAccount()
+  const base = `/api/v1/mailboxes/${mb}`
+  setPage({ title: 'Organize', description: 'Manage your IRIS folders, labels, filters and contacts.', path: '/', noindex: true })
+  let filters: FilterRule[] = []
+
+  const back = h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('back'), h('span', { className: 'btn-label' }, 'Back to mail'))
+  const topbar = h('header', { className: 'topbar organize-top' }, brand(location.hostname), back,
+    h('div', { className: 'topbar-right' }, h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email))))
+  const folderList = h('ul', { className: 'org-list' })
+  const labelList = h('ul', { className: 'org-list' })
+  const filterList = h('ul', { className: 'org-list' })
+  const row = (ic: string, text: string, ...actions: HTMLElement[]) =>
+    h('li', { className: 'org-row' }, icon(ic, 'icon icon-sm'), h('span', { className: 'org-name' }, text), h('span', { className: 'org-actions' }, ...actions))
+  const empty = (text: string) => h('li', { className: 'org-empty muted' }, text)
+
+  const drawFolders = () => {
+    const custom = customFolders()
+    folderList.replaceChildren(...(custom.length ? custom.map((f) => row('folder', `${f.name}${f.total ? ` · ${f.total}` : ''}`,
+      btn('btn btn-ghost btn-sm', 'Rename', 'pen', { onclick: () => renameFolder(f) }),
+      btn('btn btn-ghost btn-sm', 'Delete', 'trash', { onclick: () => deleteFolder(f) })))
+      : [empty('No folders yet. Folders hold messages you move into them.')]))
+  }
+  const drawLabels = () => {
+    labelList.replaceChildren(...(org.labels.length ? org.labels.map((l) => row('tag', l,
+      btn('btn btn-ghost btn-sm', 'Delete', 'trash', { onclick: () => deleteLabel(l) })))
+      : [empty('No labels yet. A message can have several labels.')]))
+  }
+  const drawFilters = () => {
+    filterList.replaceChildren(...(filters.length ? filters.map((f) => row('filter', describeFilter(f),
+      btn('btn btn-ghost btn-sm', 'Delete', 'trash', { onclick: () => deleteFilter(f) })))
+      : [empty('No filters yet. Add one below to sort new mail automatically.')]))
+    drawForm()
+  }
+
+  // Contacts: the address book behind compose autocomplete. The add form
+  // doubles as the edit form: Edit fills it and switches the button.
+  const contactList = h('ul', { className: 'org-list' })
+  let contacts: Contact[] = []
+  let editing: Contact | null = null
+  const drawContacts = () => {
+    const sorted = [...contacts].sort((a, b) => a.name.localeCompare(b.name) || a.email.localeCompare(b.email))
+    contactList.replaceChildren(...(sorted.length ? sorted.map((c) => row('account', `${c.name} · ${c.email}`,
+      btn('btn btn-ghost btn-sm', 'Edit', 'pen', { onclick: () => editContact(c) }),
+      btn('btn btn-ghost btn-sm', 'Delete', 'trash', { onclick: () => deleteContact(c) })))
+      : [empty('No contacts yet. Add people you email often and they will show up as suggestions in To, Cc and Bcc.')]))
+    if (contacts.length >= 100) contactList.append(h('li', { className: 'org-empty muted' }, 'Showing the first 100 contacts.'))
+  }
+  const contactName = h('input', { id: 'ct-name', type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'Ada Lovelace' }) as HTMLInputElement
+  const contactEmail = h('input', { id: 'ct-email', type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'ada@example.com' }) as HTMLInputElement
+  const contactError = h('div', { className: 'form-error', role: 'alert' })
+  const contactSave = h('button', { type: 'submit', className: 'btn btn-primary' }, icon('plus'), h('span', { className: 'btn-label' }, 'Add contact')) as HTMLButtonElement
+  const contactCancel = h('button', { type: 'button', className: 'btn btn-ghost btn-sm', hidden: true }, 'Cancel editing')
+  const contactForm = h('form', { className: 'org-form' },
+    h('div', { className: 'field' }, h('label', { htmlFor: 'ct-name' }, 'Name'), contactName),
+    h('div', { className: 'field org-grow org-span-2' }, h('label', { htmlFor: 'ct-email' }, 'Email'), contactEmail),
+    h('div', { className: 'org-submit' }, contactSave, contactCancel),
+    contactError)
+  const resetContactForm = () => {
+    editing = null
+    contactName.value = ''
+    contactEmail.value = ''
+    ;(contactSave.querySelector('.btn-label') as HTMLElement).textContent = 'Add contact'
+    contactCancel.hidden = true
+    contactError.replaceChildren()
+  }
+  const editContact = (c: Contact) => {
+    editing = c
+    contactName.value = c.name
+    contactEmail.value = c.email
+    ;(contactSave.querySelector('.btn-label') as HTMLElement).textContent = 'Save changes'
+    contactCancel.hidden = false
+    contactError.replaceChildren()
+    contactName.focus()
+  }
+  contactCancel.onclick = resetContactForm
+  contactForm.onsubmit = async (e) => {
+    e.preventDefault()
+    contactError.replaceChildren()
+    const name = contactName.value.trim()
+    const email = contactEmail.value.trim()
+    if (!name || !email) { contactError.append(h('span', {}, 'Enter a name and an email address.')); return }
+    const restore = busy(contactSave, 'Saving…')
+    try {
+      if (editing) {
+        const { contact } = await api<{ contact: Contact }>(`/api/v1/contacts/${encodeURIComponent(editing.id)}`, { method: 'PATCH', body: JSON.stringify({ name, email }) })
+        contacts = contacts.map((x) => x.id === contact.id ? contact : x)
+        toast('Contact saved')
+      } else {
+        const { contact } = await api<{ contact: Contact }>('/api/v1/contacts', { method: 'POST', body: JSON.stringify({ name, email }) })
+        contacts = [...contacts, contact]
+        toast('Contact added')
+      }
+      restore()
+      resetContactForm()
+      drawContacts()
+    } catch (err) {
+      restore()
+      if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+      contactError.replaceChildren(icon('alert'), h('span', {}, orgError(err)))
+    }
+  }
+  const deleteContact = async (c: Contact) => {
+    if (!(await confirmDialog(`Delete “${c.name}”?`, 'The contact is removed from your address book.', 'Delete contact'))) return
+    try {
+      await api(`/api/v1/contacts/${encodeURIComponent(c.id)}`, { method: 'DELETE' })
+      contacts = contacts.filter((x) => x.id !== c.id)
+      if (editing?.id === c.id) resetContactForm()
+      drawContacts(); toast('Contact deleted')
+    } catch (err) { toast(orgError(err)) }
+  }
+
+  const renameFolder = (f: FolderInfo) => promptDialog({
+    title: 'Rename folder', label: 'Folder name', value: f.name, confirm: 'Rename',
+    submit: async (v) => {
+      try {
+        await api(`${base}/folders/${encodeURIComponent(f.id)}`, { method: 'PATCH', body: JSON.stringify({ name: v }) })
+        f.name = v.trim()
+        drawFolders(); drawFilters()
+        return null
+      } catch (err) { return orgError(err) }
+    },
+  })
+  const deleteFolder = async (f: FolderInfo) => {
+    if (!(await confirmDialog(`Delete “${f.name}”?`, 'Only empty folders can be deleted. Messages are never deleted with a folder.', 'Delete folder'))) return
+    try {
+      await api(`${base}/folders/${encodeURIComponent(f.id)}`, { method: 'DELETE' })
+      org.folders = org.folders.filter((x) => x.id !== f.id)
+      drawFolders(); toast('Folder deleted')
+    } catch (err) { toast(orgError(err)) }
+  }
+  const deleteLabel = async (l: string) => {
+    if (!(await confirmDialog(`Delete label “${l}”?`, 'The label is removed from every message. The messages themselves stay.', 'Delete label'))) return
+    try {
+      await api(`${base}/labels/${encodeURIComponent(l)}`, { method: 'DELETE' })
+      org.labels = org.labels.filter((x) => x !== l)
+      drawLabels(); drawForm(); toast('Label deleted')
+    } catch (err) { toast(orgError(err)) }
+  }
+  const deleteFilter = async (f: FilterRule) => {
+    try {
+      await api(`${base}/filters/${encodeURIComponent(f.id)}`, { method: 'DELETE' })
+      filters = filters.filter((x) => x.id !== f.id)
+      drawFilters(); toast('Filter deleted')
+    } catch (err) { toast(orgError(err)) }
+  }
+
+  // Add-filter form.
+  const select = (id: string, options: [string, string][]) =>
+    h('select', { id, className: 'org-select' }, ...options.map(([v, l]) => h('option', { value: v }, l))) as HTMLSelectElement
+  const field = select('f-field', FILTER_FIELDS)
+  const value = h('input', { id: 'f-value', type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'e.g. newsletter@shop.com' }) as HTMLInputElement
+  const action = select('f-action', FILTER_ACTIONS)
+  const target = h('select', { id: 'f-target', className: 'org-select' }) as HTMLSelectElement
+  const targetRow = h('div', { className: 'field' }, h('label', { htmlFor: 'f-target' }, 'Target'), target)
+  const formError = h('div', { className: 'form-error', role: 'alert' })
+  const add = h('button', { type: 'submit', className: 'btn btn-primary' }, icon('plus'), h('span', { className: 'btn-label' }, 'Add filter')) as HTMLButtonElement
+  const drawForm = () => {
+    const kind = action.value
+    const opts: [string, string][] = kind === 'move'
+      ? org.folders.filter((f) => f.role === 'archive' || f.role === 'trash' || f.role === 'custom').map((f) => [f.id, f.name])
+      : kind === 'label' ? org.labels.map((l) => [l, l]) : []
+    const keep = target.value
+    target.replaceChildren(...opts.map(([v, l]) => h('option', { value: v }, l)))
+    if (opts.some(([v]) => v === keep)) target.value = keep
+    targetRow.hidden = kind !== 'move' && kind !== 'label'
+    ;(targetRow.querySelector('label') as HTMLLabelElement).textContent = kind === 'move' ? 'Folder' : 'Label'
+    add.disabled = !targetRow.hidden && !opts.length
+    formError.replaceChildren(...(!targetRow.hidden && !opts.length ? [h('span', {}, kind === 'label' ? 'Create a label first.' : 'Create a folder first.')] : []))
+  }
+  action.onchange = drawForm
+  value.oninput = () => value.removeAttribute('aria-invalid')
+  const form = h('form', { className: 'org-form' },
+    h('div', { className: 'field' }, h('label', { htmlFor: 'f-field' }, 'If'), field),
+    h('div', { className: 'field org-grow' }, h('label', { htmlFor: 'f-value' }, 'Contains'), value),
+    h('div', { className: 'field' }, h('label', { htmlFor: 'f-action' }, 'Then'), action),
+    targetRow,
+    h('div', { className: 'org-submit' }, add),
+    formError)
+  form.onsubmit = async (e) => {
+    e.preventDefault()
+    formError.replaceChildren()
+    if (!value.value.trim()) { value.setAttribute('aria-invalid', 'true'); value.focus(); formError.append(h('span', {}, 'Enter the text to look for.')); return }
+    const restore = busy(add, 'Saving…')
+    try {
+      const body = { field: field.value, value: value.value, action: action.value, target: targetRow.hidden ? null : target.value }
+      const { filter } = await api<{ filter: FilterRule }>(`${base}/filters`, { method: 'POST', body: JSON.stringify(body) })
+      filters = [...filters, filter]
+      value.value = ''
+      restore()
+      drawFilters()
+      toast('Filter added')
+    } catch (err) {
+      restore()
+      if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+      formError.replaceChildren(icon('alert'), h('span', {}, orgError(err)))
+    }
+  }
+
+  const section = (heading: string, text: string, list: HTMLElement, ...extra: HTMLElement[]) =>
+    h('section', { className: 'org-section' }, h('h2', {}, heading), h('p', { className: 'muted' }, text), list, ...extra)
+  app.className = 'app-shell'
+  app.replaceChildren(topbar, h('main', { className: 'app-main organize' }, h('div', { className: 'organize-inner' },
+    h('h1', { className: 'pane-title' }, 'Organize'),
+    section('Folders', 'Your own folders, next to Inbox, Archive and Trash.', folderList,
+      btn('btn btn-secondary btn-sm', 'New folder', 'plus', { onclick: async () => { if (await newFolderDialog(base)) drawFolders() } })),
+    section('Labels', 'Tag messages without moving them. Starred is always available.', labelList,
+      btn('btn btn-secondary btn-sm', 'New label', 'plus', { onclick: async () => { if (await newLabelDialog(base)) { drawLabels(); drawForm() } } })),
+    section('Filters', 'Filters run on the mail server as new mail arrives, even when IRIS is closed. Moves run last; the first matching move wins.', filterList, form),
+    section('Contacts', 'People you email often. They show up as suggestions when you type in To, Cc or Bcc.', contactList, contactForm))))
+  folderList.replaceChildren(skeleton(2))
+  try {
+    const [, f, ct] = await Promise.all([loadOrg(base), api<{ filters: FilterRule[] }>(`${base}/filters`), api<{ contacts: Contact[] }>('/api/v1/contacts?limit=100')])
+    filters = f.filters
+    contacts = ct.contacts
+    drawFolders(); drawLabels(); drawFilters(); drawContacts()
+  } catch (err) {
+    if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+    folderList.replaceChildren(errorState(orgError(err), () => { void renderOrganize() }))
+  }
+}
+
+// ---------- DMARC dashboard ----------
+type DmarcDomainRow = { domain: string; reports: number; messages: number; passed: number; failed: number; last_end: number }
+type DmarcOffender = { source_ip: string; messages: number; passed: number; failed: number }
+type DmarcSummary = { reports: number; domains: number; messages: number; passed: number; failed: number; first_begin: number | null; last_end: number | null; per_domain: DmarcDomainRow[]; offenders: DmarcOffender[] }
+type DmarcReportRow = { id: string; org_name: string; report_id: string; date_begin: number; date_end: number; total_messages: number; passed_messages: number; failed_messages: number }
+type DmarcSourceRow = { source_ip: string; messages: number; passed: number; failed: number }
+type DmarcDomain = { domain: string; reports: number; messages: number; passed: number; failed: number; report_list: DmarcReportRow[]; sources: DmarcSourceRow[] }
+
+const fmtDay = (unix: number) => new Date(unix * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+const pct = (part: number, total: number) => total > 0 ? `${Math.round((part / total) * 100)}%` : 'n/a'
+
+async function renderDmarc() {
+  const { email, mb } = await ensureAccount()
+  const base = `/api/v1/mailboxes/${mb}`
+  setPage({ title: 'DMARC reports', description: 'Aggregate DMARC reports for your domains.', path: '/#/dmarc', noindex: true })
+
+  const back = h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('back'), h('span', { className: 'btn-label' }, 'Back to mail'))
+  const topbar = h('header', { className: 'topbar organize-top' }, brand(location.hostname), back,
+    h('div', { className: 'topbar-right' }, h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email))))
+  const scanBtn = btn('btn btn-primary btn-sm', 'Scan inbox for reports', 'refresh') as HTMLButtonElement
+  const stats = h('div', { className: 'dmarc-stats' })
+  const domainList = h('ul', { className: 'org-list' })
+  const offenderList = h('ul', { className: 'org-list' })
+  const section = (heading: string, text: string, list: HTMLElement, ...extra: HTMLElement[]) =>
+    h('section', { className: 'org-section' }, h('h2', {}, heading), h('p', { className: 'muted' }, text), list, ...extra)
+
+  let summary: DmarcSummary | null = null
+  let expanded: string | null = null
+  const details = new Map<string, DmarcDomain>()
+
+  const stat = (value: string, label: string) =>
+    h('div', { className: 'dmarc-stat' }, h('b', {}, value), h('span', {}, label))
+
+  const drawStats = () => {
+    if (!summary) return
+    stats.replaceChildren(
+      stat(String(summary.reports), 'Reports'),
+      stat(String(summary.domains), 'Domains'),
+      stat(String(summary.messages), 'Messages checked'),
+      stat(pct(summary.passed, summary.messages), 'DMARC pass'))
+  }
+
+  const drawOffenders = () => {
+    if (!summary) return
+    offenderList.replaceChildren(...(summary.offenders.length ? summary.offenders.map((o) =>
+      h('li', { className: 'org-row' }, icon('shield', 'icon icon-sm'),
+        h('span', { className: 'org-name mono' }, o.source_ip),
+        h('span', { className: 'org-actions muted' }, `${o.messages} messages, ${o.failed} failed`)))
+      : [h('li', { className: 'org-empty muted' }, 'No failing sources. Every checked message passed DMARC.')]))
+  }
+
+  const drawDomains = () => {
+    if (!summary) return
+    if (!summary.per_domain.length) {
+      domainList.replaceChildren(h('li', { className: 'org-empty muted' }, 'No reports yet. Receiving servers send aggregate reports as attachments to your inbox; scan to import them.'))
+      return
+    }
+    domainList.replaceChildren(...summary.per_domain.map((d) => {
+      const li = h('li', { className: 'dmarc-domain' })
+      const isOpen = expanded === d.domain
+      const row = h('button', { type: 'button', className: 'dmarc-row', 'aria-expanded': String(isOpen) },
+        h('span', { className: 'dmarc-domain-name' }, d.domain),
+        h('span', { className: 'muted' }, `${d.reports} report${d.reports === 1 ? '' : 's'}`),
+        h('span', { className: 'muted' }, `${d.messages} messages`),
+        h('span', { className: d.failed > 0 ? 'dmarc-fail' : '' }, `${pct(d.passed, d.messages)} pass`),
+        h('span', { className: 'muted' }, `last ${fmtDay(d.last_end)}`))
+      row.onclick = () => { void toggleDomain(d.domain) }
+      li.append(row)
+      if (isOpen) {
+        const detail = details.get(d.domain)
+        const box = h('div', { className: 'dmarc-detail' })
+        if (!detail) {
+          box.replaceChildren(h('p', { className: 'muted' }, 'Loading…'))
+        } else {
+          const reports = h('ul', { className: 'org-list' }, ...detail.report_list.map((r) =>
+            h('li', { className: 'org-row' }, icon('mail', 'icon icon-sm'),
+              h('span', { className: 'org-name' }, `${r.org_name} · ${fmtDay(r.date_begin)} to ${fmtDay(r.date_end)}`),
+              h('span', { className: 'org-actions muted' }, `${r.total_messages} messages, ${r.failed_messages} failed`))))
+          const sources = h('ul', { className: 'org-list' }, ...(detail.sources.length ? detail.sources.map((s) =>
+            h('li', { className: 'org-row' }, icon('shield', 'icon icon-sm'),
+              h('span', { className: 'org-name mono' }, s.source_ip),
+              h('span', { className: 'org-actions muted' }, `${s.messages} messages, ${s.failed} failed`)))
+            : [h('li', { className: 'org-empty muted' }, 'No sources in these reports.')]))
+          box.replaceChildren(
+            h('h3', {}, 'Reports'),
+            reports,
+            h('h3', {}, 'Sources'),
+            sources)
+        }
+        li.append(box)
+      }
+      return li
+    }))
+  }
+
+  const toggleDomain = async (domain: string) => {
+    if (expanded === domain) { expanded = null; drawDomains(); return }
+    expanded = domain
+    drawDomains()
+    if (!details.has(domain)) {
+      try {
+        const { domain: d } = await api<{ domain: DmarcDomain }>(`${base}/dmarc/domains/${encodeURIComponent(domain)}`)
+        details.set(domain, d)
+        drawDomains()
+      } catch (err) {
+        if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+        toast('Could not load this domain.')
+        expanded = null
+        drawDomains()
+      }
+    }
+  }
+
+  const load = async () => {
+    try {
+      const { summary: s } = await api<{ summary: DmarcSummary }>(`${base}/dmarc/summary`)
+      summary = s
+      drawStats(); drawDomains(); drawOffenders()
+    } catch (err) {
+      if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+      domainList.replaceChildren(errorState('Could not load DMARC reports.', () => { void load() }))
+    }
+  }
+
+  scanBtn.onclick = async () => {
+    const restore = busy(scanBtn, 'Scanning…')
+    try {
+      const r = await api<{ scanned: number; imported: number; skipped: number }>(`${base}/dmarc/scan`, { method: 'POST' })
+      restore()
+      toast(r.imported > 0
+        ? `Imported ${r.imported} new report${r.imported === 1 ? '' : 's'} from ${r.scanned} message${r.scanned === 1 ? '' : 's'}.`
+        : 'No new reports found in your inbox.')
+      await load()
+    } catch (err) {
+      restore()
+      if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+      toast('Scan failed. Try again.')
+    }
+  }
+
+  app.className = 'app-shell'
+  app.replaceChildren(topbar, h('main', { className: 'app-main organize' }, h('div', { className: 'organize-inner' },
+    h('h1', { className: 'pane-title' }, 'DMARC reports'),
+    h('p', { className: 'muted' }, 'Aggregate reports show how receiving servers treat mail from your domains: how much passed DMARC, and which sources failed.'),
+    h('div', { className: 'org-submit' }, scanBtn),
+    section('Totals', 'Across all imported reports.', stats),
+    section('By domain', 'Open a domain to see its reports and the sources that sent mail for it.', domainList),
+    section('Worst offenders', 'Sources with the most failed messages, across all domains.', offenderList))))
+  stats.replaceChildren()
+  await load()
 }
 
 // ---------- Temp inbox ----------
 let tempTimers: number[] = []
 let onVisible: (() => void) | null = null
+// Live mailbox stream for the current view; closed on every route
+// change (stopTemp) and on sign-out, so a dead tab never holds a
+// stream open.
+let mailStream: EventSource | null = null
 document.addEventListener('visibilitychange', () => onVisible?.())
-const stopTemp = () => { tempTimers.forEach(clearInterval); tempTimers = []; onVisible = null }
+const stopTemp = () => { tempTimers.forEach(clearInterval); tempTimers = []; onVisible = null; mailStream?.close(); mailStream = null }
 const TEMP_KEY = 'iris_temp_inbox'
 const savedTemp = (): TempInbox | null => { try { return JSON.parse(sessionStorage.getItem(TEMP_KEY) ?? 'null') } catch { return null } }
 const saveTemp = (t: TempInbox | null) => { try { t ? sessionStorage.setItem(TEMP_KEY, JSON.stringify(t)) : sessionStorage.removeItem(TEMP_KEY) } catch { /* storage blocked */ } }
@@ -1165,7 +2132,7 @@ async function renderTempStart(note = '') {
   stopTemp()
   setPage({ title: 'Free temporary email', description: 'Get a free disposable email address in one click. Receive-only, no sign-up, deleted automatically after 1 hour.', path: '/#/temp' })
   if (!account) {
-    try { const s = await api<{ email: string }>('/api/v1/session'); account = { email: s.email, mb: '' } } catch { account = null }
+    try { const s = await api<{ email: string; is_admin?: boolean }>('/api/v1/session'); account = { email: s.email, mb: '', is_admin: s.is_admin === true } } catch { account = null }
   }
   const loggedIn = !!account
   const status = h('div', { className: 'form-error', role: 'alert' }, ...(note ? [icon('alert'), note] : []))
@@ -1213,13 +2180,29 @@ function renderTempExpired(inbox: TempInbox) {
   create.focus()
 }
 
+function renderTempDeleted(inbox: TempInbox) {
+  stopTemp()
+  saveTemp(null)
+  setPage({ title: 'Address deleted', description: 'This temporary address was deleted.', path: '/#/temp', noindex: true })
+  const create = btn('btn btn-primary btn-block', 'Create new address', 'pen')
+  create.onclick = () => renderTempStart()
+  simplePage('auth-main',
+    h('section', { className: 'auth-card expired' },
+      mascot('cat-sleep', 'mascot expired-cat'),
+      h('h1', {}, 'This address is deleted.'),
+      h('code', { className: 'temp-address strikethrough' }, inbox.address),
+      h('p', { className: 'muted' }, 'Its messages were deleted and can’t be recovered.'),
+      create))
+  create.focus()
+}
+
 async function renderTempInbox(inbox: TempInbox, justCreated = false) {
   stopTemp()
   setPage({ title: 'Your temporary inbox', description: 'Tvoja privremena adresa.', path: '/#/temp', noindex: true })
   // Resolve auth state so the topbar reflects a logged-in session instead of
   // always showing "Sign in" (issue: logged-in users saw "Sign in" on /#/temp).
   if (!account) {
-    try { const s = await api<{ email: string }>('/api/v1/session'); account = { email: s.email, mb: '' } } catch { account = null }
+    try { const s = await api<{ email: string; is_admin?: boolean }>('/api/v1/session'); account = { email: s.email, mb: '', is_admin: s.is_admin === true } } catch { account = null }
   }
   const loggedIn = !!account
   const auth = { headers: { authorization: `Bearer ${inbox.access_token}` } }
@@ -1231,12 +2214,14 @@ async function renderTempInbox(inbox: TempInbox, justCreated = false) {
   const countdownEl = h('span', { className: 'countdown', role: 'timer' })
   const stickyCount = h('span', { className: 'sticky-count', role: 'timer' })
   const expiryChip = h('span', { className: 'expiry-chip' })
+  const expiryTime = h('div', { className: 'expiry-time' })
   const tickBar = h('div', { className: 'tick-bar', 'aria-hidden': 'true' }, ...Array.from({ length: 60 }, () => h('span', { className: 'tick' })))
   const tick = () => {
     const s = Math.max(0, Math.floor((Date.parse(inbox.expires_at) - Date.now()) / 1000))
     const t = [Math.floor(s / 3600), Math.floor((s % 3600) / 60), s % 60].map((n) => String(n).padStart(2, '0')).join(':')
     countdownEl.textContent = t
     stickyCount.textContent = `Expires in ${t.replace(/^00:/, '')}`
+    expiryTime.textContent = `at ${fmtTime(new Date(inbox.expires_at))}`
     ;[countdownEl, stickyCount].forEach((el) => { el.classList.toggle('urgent', s <= 600); el.classList.toggle('danger', s <= 60) })
     expiryChip.classList.toggle('urgent', s <= 600)
     expiryChip.replaceChildren(icon('timer', 'icon icon-sm'), s <= 60 ? 'Under a minute' : s <= 600 ? `${Math.ceil(s / 60)} min left · expiring` : `${Math.ceil(s / 60)} min left`)
@@ -1257,9 +2242,51 @@ async function renderTempInbox(inbox: TempInbox, justCreated = false) {
     h('span', { className: 'live-status' }, h('span', { className: 'live-dot' }), 'Live'))
 
   const newBtn = () => btn('btn btn-secondary btn-block', 'New address', 'pen', { onclick: discard })
+  // Extend / delete: same Bearer token as every other temp call, so one
+  // browser can only touch its own inbox.
+  let extensionsLeft = inbox.extensions_left
+  const extNote = h('p', { className: 'rail-note' })
+  const extendBtn = btn('btn btn-secondary btn-block', 'Extend by 1 hour', 'clock', { onclick: () => { void doExtend() } }) as HTMLButtonElement
+  const deleteBtn = btn('btn btn-ghost btn-block', 'Delete address', 'trash', { onclick: () => { void doDelete() } }) as HTMLButtonElement
+  const updateExt = () => {
+    extendBtn.disabled = extensionsLeft !== undefined && extensionsLeft <= 0
+    extendBtn.title = extensionsLeft !== undefined && extensionsLeft <= 0 ? 'No extensions left for this address.' : 'Add 1 hour to this address.'
+    extNote.textContent = extensionsLeft === undefined ? '' : extensionsLeft <= 0 ? 'No extensions left for this address.' : `${extensionsLeft} extension${extensionsLeft === 1 ? '' : 's'} left, 1 hour each.`
+  }
+  const doExtend = async () => {
+    const restore = busy(extendBtn, 'Extending…')
+    try {
+      const updated = await api<TempInbox>(`${base}/extend`, { ...auth, method: 'POST' })
+      inbox.expires_at = updated.expires_at
+      inbox.extensions_left = updated.extensions_left
+      extensionsLeft = updated.extensions_left
+      saveTemp(inbox)
+      updateExt()
+      tick()
+      toast('Address extended by 1 hour.')
+    } catch (err) {
+      if ([401, 404, 410].includes((err as HttpError).status)) return expired()
+      if ((err as HttpError).code === 'extension_limit_reached') { extensionsLeft = 0; updateExt() }
+      toast(tempErrors[(err as HttpError).code] ?? 'Could not extend this address.')
+    } finally { restore() }
+  }
+  const doDelete = async () => {
+    const ok = await confirmDialog('Delete this address?', 'The address stops working right away and its messages will be deleted. You cannot undo this.', 'Delete address')
+    if (!ok) return
+    const restore = busy(deleteBtn, 'Deleting…')
+    try {
+      await api(`${base}/delete`, { ...auth, method: 'POST' })
+      renderTempDeleted(inbox)
+    } catch (err) {
+      if ([401, 404, 410].includes((err as HttpError).status)) return expired()
+      toast('Could not delete this address. Please try again.')
+    } finally { restore() }
+  }
+  updateExt()
   const rail = h('aside', { className: 'expiry-rail', ariaLabel: 'Expiry' },
     h('div', { className: 'expiry-label' }, 'Expires in'), countdownEl,
-    h('div', { className: 'expiry-time' }, `at ${fmtTime(new Date(inbox.expires_at))}`), tickBar,
+    expiryTime, tickBar,
+    extendBtn, extNote, deleteBtn,
     newBtn(),
     h('p', { className: 'rail-note' }, 'Starting a new address forgets this one in this browser. Mail still arrives until it expires.'))
   const stickyBar = h('div', { className: 'temp-sticky' }, stickyCount, copyButton(inbox.address, 'Copy address', 'btn btn-primary btn-sm', 'Copy'))
@@ -1309,6 +2336,18 @@ async function renderTempInbox(inbox: TempInbox, justCreated = false) {
       if (!loaded) ui.list.replaceChildren(errorState(tempErrors[(err as HttpError).code] ?? 'Could not load messages.', load))
     }
   }
+  // Sync the expiry and remaining extensions with the server once, so a
+  // restored tab shows the truth instead of the saved snapshot.
+  api<{ expires_at: string; extensions_left: number }>(base, auth)
+    .then((st) => {
+      inbox.expires_at = st.expires_at
+      inbox.extensions_left = st.extensions_left
+      extensionsLeft = st.extensions_left
+      saveTemp(inbox)
+      updateExt()
+      tick()
+    })
+    .catch((err) => { if ([401, 404, 410].includes((err as HttpError).status)) expired() })
   tick(); load()
   tempTimers = [window.setInterval(tick, 1000), window.setInterval(() => { if (!document.hidden) load() }, 5_000)]
   onVisible = () => { if (!document.hidden) { tick(); load() } }
@@ -1335,6 +2374,181 @@ function renderNotFound() {
     h('a', { href: '#/temp', className: 'link' }, 'Get a temporary inbox →')))
 }
 
+// ---------- Admin dashboard ----------
+type AdminUser = {
+  id: string; email: string; display_name: string; role: string; status: string; created_at: string
+  mailboxes: { email_address: string; quota_bytes: number; status: string }[]
+  active_sessions: number; last_seen_at: string | null
+}
+type AdminSummary = {
+  users: { total: number; active: number; disabled: number; truncated: boolean; list: AdminUser[] }
+  quotas: {
+    sends_per_hour: number
+    reads: { max: number; window_minutes: number }
+    temp_inbox: { domain: string; default_expiry_hours: number; creates_per_ip_per_hour: number; active_per_client: number; message_limit: number }
+    compose: { max_recipients: number; max_body_bytes: number; max_attachments: number; max_attachment_bytes: number; max_total_attachment_bytes: number }
+    organize: { max_labels: number; max_custom_folders: number; max_filters: number }
+    integration_email_enabled: boolean
+    relay_configured: boolean
+  }
+  delivery: {
+    transactional_last_24h: Record<string, number>
+    transactional_last_7d: Record<string, number>
+    transactional_per_app_last_7d: Record<string, Record<string, number>>
+    transactional_recent: { id: string; app_id: string; template_id: string; status: string; provider_message_id: string | null; created_at: string }[]
+    integration_keys: { key_id: string; app_id: string; status: string; daily_send_limit: number; last_used_at: string | null; expires_at: string | null }[]
+    user_sends_last_24h: number
+  }
+  temp_inboxes: {
+    by_status: Record<string, { count: number; messages: number; bytes: number }>
+    created_last_24h: number
+    active_list: { id: string; address: string; created_at: string; expires_at: string; message_count: number }[]
+  }
+}
+
+/** Admin dashboard: users, quotas, delivery status, and the actions
+ * an admin can take on them. The server gates every admin endpoint,
+ * so a non-admin only ever sees the "not an admin" notice below,
+ * never the data. */
+async function renderAdmin() {
+  const { email } = await ensureAccount()
+  setPage({ title: 'Admin', description: 'IRIS admin dashboard: users, quotas and delivery status.', path: '/', noindex: true })
+  const back = h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('back'), h('span', { className: 'btn-label' }, 'Back to mail'))
+  const topbar = h('header', { className: 'topbar organize-top' }, brand(location.hostname), back,
+    h('div', { className: 'topbar-right' }, h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email))))
+  const title = h('h1', { className: 'pane-title' }, 'Admin')
+  const intro = h('p', { className: 'muted' }, 'Users, quotas and delivery status. Disable users, revoke sessions and keys, and delete temp inboxes.')
+  const body = h('div', { className: 'admin-inner' })
+  app.className = 'app-shell'
+  app.replaceChildren(topbar, h('main', { className: 'app-main organize' }, body))
+  body.replaceChildren(title, intro, skeleton(4))
+
+  const stat = (label: string, value: string) =>
+    h('div', { className: 'admin-stat' }, h('strong', {}, value), h('span', {}, label))
+  const countsText = (m: Record<string, number>) => {
+    const parts = Object.entries(m).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k} ${v}`)
+    return parts.length ? parts.join(' · ') : 'none yet'
+  }
+  const table = (headers: string[], rows: (string | HTMLElement)[][]) =>
+    h('div', { className: 'admin-scroll' }, h('table', { className: 'admin-table' },
+      h('thead', {}, h('tr', {}, ...headers.map((x) => h('th', { scope: 'col' }, x)))),
+      h('tbody', {}, ...rows.map((r) => h('tr', {}, ...r.map((c) => h('td', {}, c)))))))
+  const section = (heading: string, text: string, ...kids: HTMLElement[]) =>
+    h('section', { className: 'org-section' }, h('h2', {}, heading), h('p', { className: 'muted' }, text), ...kids)
+  /** Friendly text for the error codes the admin actions can answer. */
+  const adminError = (err: unknown) => ({
+    user_not_active: 'That user is already disabled.',
+    user_not_disabled: 'That user is already active.',
+    cannot_disable_self: 'You cannot disable your own account.',
+    key_not_active: 'That key is already revoked.',
+    temp_inbox_not_active: 'That inbox is already gone.',
+    not_found: 'That item no longer exists. Reload the page to see the latest state.',
+  }[(err as HttpError).code] ?? 'Something went wrong. Try again.')
+  /** Confirm, run one admin action, toast the outcome, reload the page. */
+  const adminAction = async (confirm: [string, string, string], path: string, done: string) => {
+    if (!(await confirmDialog(confirm[0], confirm[1], confirm[2]))) return
+    try { await api(path, { method: 'POST' }); toast(done); void renderAdmin() } catch (err) { toast(adminError(err)) }
+  }
+
+  try {
+    const s = await api<AdminSummary>('/api/v1/admin/summary')
+    const t24 = s.delivery.transactional_last_24h
+    const tempActive = s.temp_inboxes.by_status.active?.count ?? 0
+    const userRows = s.users.list.map((u) => {
+      const actions = u.email === email
+        ? h('span', { className: 'muted' }, 'This is you')
+        : h('span', { className: 'admin-actions' },
+          u.status === 'active'
+            ? btn('btn btn-ghost btn-sm', 'Disable', undefined, { onclick: () => void adminAction(
+              [`Disable ${u.email}?`, 'The account cannot sign in until you enable it again.', 'Disable user'],
+              `/api/v1/admin/users/${u.id}/disable`, `${u.email} disabled`) })
+            : btn('btn btn-ghost btn-sm', 'Enable', undefined, { onclick: () => void adminAction(
+              [`Enable ${u.email}?`, 'The account can sign in again.', 'Enable user'],
+              `/api/v1/admin/users/${u.id}/enable`, `${u.email} enabled`) }),
+          btn('btn btn-ghost btn-sm', 'Revoke sessions', undefined, { onclick: () => void adminAction(
+            [`Revoke sessions for ${u.email}?`, 'The account is signed out everywhere at once.', 'Revoke sessions'],
+            `/api/v1/admin/users/${u.id}/revoke-sessions`, `Sessions revoked for ${u.email}`) }))
+      return [
+        u.email,
+        u.display_name,
+        u.role,
+        u.status,
+        u.mailboxes.length ? u.mailboxes.map((m) => `${m.email_address} (${fmtBytes(m.quota_bytes)})`).join(', ') : '—',
+        String(u.active_sessions),
+        u.last_seen_at ? fmtDate(u.last_seen_at) : '—',
+        fmtDate(u.created_at),
+        actions,
+      ]
+    })
+    const perAppRows = Object.entries(s.delivery.transactional_per_app_last_7d)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([app, c]) => [app, String(c.accepted ?? 0), String(c.failed ?? 0), String(c.sending ?? 0), String(c.unknown ?? 0)])
+    body.replaceChildren(title, intro,
+      h('div', { className: 'admin-stats' },
+        stat('Users', String(s.users.total)),
+        stat('Active users', String(s.users.active)),
+        stat('Transactional accepted, 24h', String(t24.accepted ?? 0)),
+        stat('Transactional failed, 24h', String(t24.failed ?? 0)),
+        stat('User sends, 24h', String(s.delivery.user_sends_last_24h)),
+        stat('Active temp inboxes', String(tempActive))),
+      section('Users', s.users.truncated ? `Showing the 100 newest of ${s.users.total} users.` : `${s.users.total} users.`,
+        table(['Email', 'Name', 'Role', 'Status', 'Mailboxes', 'Sessions', 'Last seen', 'Joined', 'Actions'], userRows)),
+      section('Quotas', 'Limits in force for every user. Mailbox quotas are per mailbox, in the users table above.',
+        table(['Limit', 'Value'], [
+          ['Sends', `${s.quotas.sends_per_hour} per hour`],
+          ['Message reads', `${s.quotas.reads.max} per ${s.quotas.reads.window_minutes} minutes`],
+          ['Temp inbox domain', s.quotas.temp_inbox.domain],
+          ['Temp inbox lifetime', `${s.quotas.temp_inbox.default_expiry_hours} hour`],
+          ['Temp inbox creates', `${s.quotas.temp_inbox.creates_per_ip_per_hour} per IP per hour`],
+          ['Temp inboxes per browser', String(s.quotas.temp_inbox.active_per_client)],
+          ['Temp inbox message list', String(s.quotas.temp_inbox.message_limit)],
+          ['Compose recipients', String(s.quotas.compose.max_recipients)],
+          ['Compose body', fmtBytes(s.quotas.compose.max_body_bytes)],
+          ['Compose attachments', `${s.quotas.compose.max_attachments} files, ${fmtBytes(s.quotas.compose.max_attachment_bytes)} each, ${fmtBytes(s.quotas.compose.max_total_attachment_bytes)} total`],
+          ['Labels', String(s.quotas.organize.max_labels)],
+          ['Custom folders', String(s.quotas.organize.max_custom_folders)],
+          ['Filters', String(s.quotas.organize.max_filters)],
+          ['Transactional email', s.quotas.integration_email_enabled ? 'enabled' : 'disabled'],
+          ['Outbound relay', s.quotas.relay_configured ? 'configured' : 'not configured'],
+        ])),
+      section('Delivery', 'Transactional email is the API that lets companion apps send auth mail. User sends are counted in aggregate only; individual sends are not attributed.',
+        h('p', { className: 'muted' }, `Last 24h: ${countsText(t24)}`),
+        h('p', { className: 'muted' }, `Last 7 days: ${countsText(s.delivery.transactional_last_7d)}`),
+        table(['App', 'Accepted', 'Failed', 'Sending', 'Unknown'], perAppRows.length ? perAppRows : [['—', '0', '0', '0', '0']]),
+        table(['Time', 'App', 'Template', 'Status', 'Provider id'], s.delivery.transactional_recent.map((r) => [
+          fmtDate(r.created_at), r.app_id, r.template_id, r.status, r.provider_message_id ?? '—',
+        ])),
+        table(['App', 'Status', 'Daily limit', 'Last used', 'Expires', 'Actions'], s.delivery.integration_keys.map((k) => [
+          k.app_id, k.status, String(k.daily_send_limit), k.last_used_at ? fmtDate(k.last_used_at) : '—', k.expires_at ? fmtDate(k.expires_at) : '—',
+          k.status === 'active'
+            ? btn('btn btn-ghost btn-sm', 'Revoke', undefined, { onclick: () => void adminAction(
+              [`Revoke the ${k.app_id} key?`, 'Apps using this key stop authenticating at once.', 'Revoke key'],
+              `/api/v1/admin/integration-keys/${k.key_id}/revoke`, `Key revoked for ${k.app_id}`) })
+            : h('span', { className: 'muted' }, '—'),
+        ]))),
+      section('Temp inboxes', `${s.temp_inboxes.created_last_24h} created in the last 24 hours.`,
+        table(['Status', 'Inboxes', 'Messages', 'Bytes'], Object.entries(s.temp_inboxes.by_status)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([status, c]) => [status, String(c.count), String(c.messages), fmtBytes(c.bytes)])),
+        ...(s.temp_inboxes.active_list.length
+          ? [table(['Address', 'Created', 'Expires', 'Messages', 'Actions'], s.temp_inboxes.active_list.map((t) => [
+            t.address, fmtDate(t.created_at), fmtDate(t.expires_at), String(t.message_count),
+            btn('btn btn-ghost btn-sm', 'Delete', undefined, { onclick: () => void adminAction(
+              [`Delete ${t.address}?`, 'The address stops working right away and its messages will be deleted. You cannot undo this.', 'Delete address'],
+              `/api/v1/admin/temp-inboxes/${t.id}/delete`, `${t.address} deleted`) }),
+          ]))]
+          : [h('p', { className: 'muted' }, 'No active temp inboxes right now.')])))
+
+  } catch (err) {
+    if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+    if ((err as HttpError).status === 403) {
+      body.replaceChildren(title, h('p', { className: 'muted' }, 'This page is only for admins. Your account is not on the admin list.'))
+      return
+    }
+    body.replaceChildren(title, errorState('Could not load the dashboard. Try again.', () => { void renderAdmin() }))
+  }
+}
+
 // ---------- Router ----------
 function route() {
   stopTemp()
@@ -1346,9 +2560,20 @@ function route() {
     return renderTempStart()
   }
   if (r === '/signed-out') return renderSignedOut()
-  const folder = r === '/' ? 'inbox' : FOLDERS.find((f) => `/${f.role}` === r)?.role
-  if (!folder) return renderNotFound()
-  renderMailbox(folder).catch((err) => {
+  let view: MailView | undefined
+  try {
+    if (r === '/') view = { kind: 'role', role: 'inbox' }
+    else if (r === '/starred') view = { kind: 'starred' }
+    else if (r.startsWith('/folder/')) view = { kind: 'folder', id: decodeURIComponent(r.slice(8)) }
+    else if (r.startsWith('/label/')) view = { kind: 'label', name: decodeURIComponent(r.slice(7)) }
+    else {
+      const role = FOLDERS.find((f) => `/${f.role}` === r)?.role
+      if (role) view = { kind: 'role', role }
+    }
+  } catch { /* malformed escape in the hash */ }
+  const page = r === '/organize' ? renderOrganize() : r === '/dmarc' ? renderDmarc() : r === '/admin' ? renderAdmin() : view ? renderMailbox(view) : undefined
+  if (!page) return renderNotFound()
+  page.catch((err) => {
     if ((err as HttpError).status === 401) { account = null; return renderLogin() }
     setPage({ title: 'Unavailable', description: 'vahid.im je privremeno nedostupan.', noindex: true })
     simplePage('auth-main', h('section', { className: 'auth-card center' },
