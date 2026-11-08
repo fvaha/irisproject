@@ -1,4 +1,5 @@
 import { SITE, footerLinks, initSite, setPage } from './site'
+import { BRAND, brandHost, initBrand } from './brand'
 
 type Summary = { id: string; from: string; to: string[]; subject: string; preview: string; received_at: string; is_read: boolean; is_draft?: boolean; has_attachment?: boolean; is_starred?: boolean; labels?: string[]; thread_id?: string | null }
 type Attachment = { part_id: string; blob_id: string; name: string; content_type: string; size: number; disposition?: string | null }
@@ -103,7 +104,7 @@ const errorText: Record<string, string> = {
   database_unavailable: 'Servis je privremeno nedostupan. Pokušaj ponovo za koji minut.',
   turnstile_failed: 'Verification failed. Please try again.',
   turnstile_unavailable: 'Verification is temporarily unavailable. Please try again shortly.',
-  network: 'Can’t reach IRIS. Check your connection and try again.',
+  network: 'Can’t reach the mail server. Check your connection and try again.',
 }
 const tempErrors: Record<string, string> = {
   rate_limited: 'Too many addresses created from your network. Try again later.',
@@ -112,7 +113,11 @@ const tempErrors: Record<string, string> = {
   network: errorText.network,
 }
 
-const brand = (sub: string) => h('a', { href: '#/', className: 'brand', ariaLabel: 'vahid.im — početna' }, h('span', { className: 'brand-mark' }, eyeMark(), 'vahid.im'), h('span', { className: 'brand-sub' }, sub))
+// Deployment logo when branding.json sets one, otherwise the built-in mark.
+const brandMark = (cls = 'eye-mark') => BRAND.logoUrl
+  ? h('img', { src: BRAND.logoUrl, alt: '', className: `${cls} brand-logo` })
+  : eyeMark(cls)
+const brand = (sub: string) => h('a', { href: '#/', className: 'brand', ariaLabel: `${BRAND.name} — home` }, h('span', { className: 'brand-mark' }, brandMark(), BRAND.name), h('span', { className: 'brand-sub' }, sub))
 
 // ---------- cat with trackable eyes ----------
 const CAT_BODY = `
@@ -207,7 +212,7 @@ function field(id: string, label: string, ic: string, input: HTMLInputElement, e
 }
 
 function renderLogin() {
-  setPage({ title: 'Sign in', description: 'Prijavi se na webmail.vahid.im svojim mejl nalogom.', path: '/' })
+  setPage({ title: 'Sign in', description: `Sign in to your ${brandHost()} mailbox.`, path: '/' })
   const status = h('div', { className: 'form-error', role: 'alert' })
   const email = h('input', { type: 'email', name: 'email', id: 'email', autocomplete: 'username', inputMode: 'email', placeholder: 'you@example.com', spellcheck: false }) as HTMLInputElement
   const password = h('input', { type: 'password', name: 'password', id: 'password', autocomplete: 'current-password' }) as HTMLInputElement
@@ -266,13 +271,13 @@ function renderLogin() {
   }
 
   const left = h('div', { className: 'login-left' },
-    h('div', { className: 'topline' }, h('span', { className: 'wordmark' }, eyeMark('eye-mark wordmark-eye'), 'vahid.im'), h('span', {}, 'webmail')),
-    h('p', { className: 'login-tagline' }, h('span', {}, 'Svaka'), h('span', {}, 'poruka'), h('span', {}, 'nađe'), h('span', {}, 'svoj put.')),
+    h('div', { className: 'topline' }, h('span', { className: 'wordmark' }, brandMark('eye-mark wordmark-eye'), BRAND.name), h('span', {}, BRAND.product)),
+    h('p', { className: 'login-tagline' }, ...BRAND.tagline.split(/\s+/).map((w) => h('span', {}, w))),
     h('div', { className: 'login-route', 'aria-hidden': 'true' }, h('div', { className: 'route-line' }), h('div', { className: 'route-nodes' }, h('span', { className: 'route-node-sq' }), h('span', { className: 'route-node-sq' }), h('span', { className: 'route-node-rd' })), catWrap),
     h('div', { className: 'login-footer' }, h('span', {}, 'MX → Auth → Inbox'), h('span', {}, location.hostname)))
   const form = h('form', { className: 'login-form', noValidate: true },
     emailF.wrap, pwF.wrap, ...(SITE.turnstileSiteKey ? [turnstileBox] : []), status, submit,
-    h('p', { className: 'login-foot' }, 'Prijava ide tvojim mejl nalogom na vahid.im.'))
+    h('p', { className: 'login-foot' }, `Sign in with your mail account on ${brandHost()}.`))
   const right = h('main', { className: 'login-right' },
     h('div', { className: 'login-panel' }, h('h1', {}, 'Sign in'), form),
     footerLinks())
@@ -1316,7 +1321,7 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
   const key = viewKey(view)
   let meta = viewMeta(view)
   const base = `/api/v1/mailboxes/${mb}`
-  setPage({ title: meta.label, description: `Tvoj vahid.im ${meta.label.toLowerCase()}.`, path: '/', noindex: true })
+  setPage({ title: meta.label, description: `Your ${meta.label.toLowerCase()}.`, path: '/', noindex: true })
 
   let all: Summary[] = (mb && readListCache(email, mb, key)) || []
   let query = ''
@@ -1401,7 +1406,7 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
         tabCounts.get(f.role as FolderRole)!.textContent = n ? String(n) : ''
       }
       nav.draw()
-      if (view.kind === 'folder') { meta = viewMeta(view); title.textContent = meta.label; setPage({ title: meta.label, description: 'Your IRIS folder.', path: '/', noindex: true }) }
+      if (view.kind === 'folder') { meta = viewMeta(view); title.textContent = meta.label; setPage({ title: meta.label, description: `Your ${BRAND.name} folder.`, path: '/', noindex: true }) }
     } catch { /* counts are optional */ }
   }
 
@@ -1739,7 +1744,7 @@ function describeFilter(f: FilterRule) {
 async function renderOrganize() {
   const { email, mb } = await ensureAccount()
   const base = `/api/v1/mailboxes/${mb}`
-  setPage({ title: 'Organize', description: 'Manage your IRIS folders, labels, filters and contacts.', path: '/', noindex: true })
+  setPage({ title: 'Organize', description: `Manage your ${BRAND.name} folders, labels, filters and contacts.`, path: '/', noindex: true })
   let filters: FilterRule[] = []
 
   const back = h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('back'), h('span', { className: 'btn-label' }, 'Back to mail'))
@@ -1944,7 +1949,7 @@ async function renderOrganize() {
       btn('btn btn-secondary btn-sm', 'New folder', 'plus', { onclick: async () => { if (await newFolderDialog(base)) drawFolders() } })),
     section('Labels', 'Tag messages without moving them. Starred is always available.', labelList,
       btn('btn btn-secondary btn-sm', 'New label', 'plus', { onclick: async () => { if (await newLabelDialog(base)) { drawLabels(); drawForm() } } })),
-    section('Filters', 'Filters run on the mail server as new mail arrives, even when IRIS is closed. Moves run last; the first matching move wins.', filterList, form),
+    section('Filters', `Filters run on the mail server as new mail arrives, even when ${BRAND.name} is closed. Moves run last; the first matching move wins.`, filterList, form),
     section('Contacts', 'People you email often. They show up as suggestions when you type in To, Cc or Bcc.', contactList, contactForm))))
   folderList.replaceChildren(skeleton(2))
   try {
@@ -2125,7 +2130,7 @@ const saveTemp = (t: TempInbox | null) => { try { t ? sessionStorage.setItem(TEM
 
 function simplePage(cls: string, ...kids: HTMLElement[]) {
   app.className = 'auth-shell'
-  app.replaceChildren(h('header', { className: 'simple-top' }, brand('Meow Labs')), h('main', { className: cls }, ...kids), footerLinks())
+  app.replaceChildren(h('header', { className: 'simple-top' }, brand(BRAND.product)), h('main', { className: cls }, ...kids), footerLinks())
 }
 
 async function renderTempStart(note = '') {
@@ -2356,10 +2361,10 @@ async function renderTempInbox(inbox: TempInbox, justCreated = false) {
 
 // ---------- Thank-you + 404 ----------
 function renderSignedOut() {
-  setPage({ title: 'Signed out', description: 'You have been signed out of IRIS.', path: '/#/signed-out', noindex: true })
+  setPage({ title: 'Signed out', description: `You have been signed out of ${BRAND.name}.`, path: '/#/signed-out', noindex: true })
   simplePage('auth-main', h('section', { className: 'auth-card center' },
     h('h1', {}, 'You’re signed out.'),
-    h('p', { className: 'muted' }, 'Thanks for using IRIS. Your session and its mail-server password were removed from this device.'),
+    h('p', { className: 'muted' }, `Thanks for using ${BRAND.name}. Your session and its mail-server password were removed from this device.`),
     h('a', { href: '#/', className: 'btn btn-ink btn-block' }, h('span', { className: 'btn-label' }, 'Sign in again')),
     h('a', { href: '#/temp', className: 'link' }, 'Or get a temporary inbox →')))
 }
@@ -2412,7 +2417,7 @@ type AdminSummary = {
  * never the data. */
 async function renderAdmin() {
   const { email } = await ensureAccount()
-  setPage({ title: 'Admin', description: 'IRIS admin dashboard: users, quotas and delivery status.', path: '/', noindex: true })
+  setPage({ title: 'Admin', description: `${BRAND.name} admin dashboard: users, quotas and delivery status.`, path: '/', noindex: true })
   const back = h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('back'), h('span', { className: 'btn-label' }, 'Back to mail'))
   const topbar = h('header', { className: 'topbar organize-top' }, brand(location.hostname), back,
     h('div', { className: 'topbar-right' }, h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email))))
@@ -2575,12 +2580,11 @@ function route() {
   if (!page) return renderNotFound()
   page.catch((err) => {
     if ((err as HttpError).status === 401) { account = null; return renderLogin() }
-    setPage({ title: 'Unavailable', description: 'vahid.im je privremeno nedostupan.', noindex: true })
+    setPage({ title: 'Unavailable', description: `${BRAND.name} is temporarily unavailable.`, noindex: true })
     simplePage('auth-main', h('section', { className: 'auth-card center' },
-      h('h1', {}, 'vahid.im je nedostupan.'),
+      h('h1', {}, `${BRAND.name} is unavailable.`),
       errorState(errorText[(err as HttpError).code] ?? 'The service did not respond.', route)))
   })
 }
 window.addEventListener('hashchange', route)
-initSite()
-route()
+initBrand().finally(() => { initSite(); route() })

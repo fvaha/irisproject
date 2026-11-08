@@ -9,6 +9,12 @@ const DEFAULTS: Record<string, string> = {
   VITE_SITE_URL: 'https://mail.example.com',
   VITE_CONTACT_EMAIL: 'admin@example.com',
   VITE_CONTACT_ADDRESS: '', // postal address shown on Privacy/Terms; empty = hidden
+  // Product branding baked into the bundle. A deployment can override all of
+  // it at runtime with /branding.json (see src/brand.ts) — no rebuild needed.
+  VITE_BRAND_NAME: 'IRIS',
+  VITE_BRAND_TAGLINE: 'Every message finds its way.',
+  VITE_BRAND_PRODUCT: 'webmail',
+  VITE_BRAND_THEME_COLOR: '#B83232',
   VITE_ANALYTICS_SRC: '', // Umami — empty = analytics off
   VITE_ANALYTICS_WEBSITE_ID: '', // Umami website ID — empty = analytics off
   VITE_MAIL_CONTENT_ORIGIN: '', // separate HTML-mail origin — empty = srcdoc frame

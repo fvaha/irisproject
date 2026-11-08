@@ -335,6 +335,18 @@ sudo cp deploy/caddy/Caddyfile /etc/caddy/Caddyfile
 sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
 ```
 
+### 3b. Branding (white-label)
+
+Name, tagline, logo, theme colour, contact details and footer links come from
+`/branding.json`, read at runtime — no rebuild:
+
+```bash
+# copy your branding next to the app; omit it and the defaults (IRIS) are used
+sudo install -m 644 branding.json /srv/iris/dist/branding.json
+```
+
+Full schema: [`docs/branding.md`](docs/branding.md).
+
 ### 4. Verify before go-live
 
 ```bash

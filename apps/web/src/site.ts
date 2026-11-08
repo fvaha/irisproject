@@ -1,11 +1,16 @@
 // Site-wide concerns shared by the app and the static pages:
 // per-page meta tags, cookie consent, opt-in analytics and the footer.
 
+import { BRAND } from './brand'
+
 const env = import.meta.env
+
+// Deployment values: build-time env first, runtime /branding.json (brand.ts)
+// on top. Accessors, not constants — the brand loads after this module.
 export const SITE = {
-  url: (env.VITE_SITE_URL || location.origin).replace(/\/$/, ''),
-  contactEmail: env.VITE_CONTACT_EMAIL || '',
-  contactAddress: env.VITE_CONTACT_ADDRESS || '',
+  get url() { return (BRAND.url || env.VITE_SITE_URL || location.origin).replace(/\/$/, '') },
+  get contactEmail() { return BRAND.contactEmail || env.VITE_CONTACT_EMAIL || '' },
+  get contactAddress() { return BRAND.contactAddress || env.VITE_CONTACT_ADDRESS || '' },
   // Umami: script URL + website ID. Analytics stays off unless both are set.
   analyticsSrc: env.VITE_ANALYTICS_SRC || '',
   analyticsWebsiteId: env.VITE_ANALYTICS_WEBSITE_ID || '',
@@ -34,7 +39,7 @@ function meta(selector: string, attr: string, value: string) {
 
 let currentPath = location.pathname
 export function setPage(p: { title: string; description: string; path?: string; noindex?: boolean }) {
-  const title = p.title === 'vahid.im' ? 'vahid.im — Webmail' : `${p.title} · vahid.im`
+  const title = p.title === BRAND.name ? `${BRAND.name} — ${BRAND.tagline}` : `${p.title} · ${BRAND.name}`
   const url = SITE.url + (p.path ?? '/')
   document.title = title
   meta('meta[name="description"]', 'content', p.description)
@@ -95,10 +100,10 @@ export function showCookieBanner(force = false) {
   bar.setAttribute('role', 'region')
   bar.setAttribute('aria-label', 'Cookie notice')
   bar.innerHTML = hasAnalytics
-    ? `<p>vahid.im koristi neophodne kolačiće za prijavu. Uz tvoju dozvolu brojimo i anonimne posete — nikad sadržaj poruka. <a href="/privacy/#cookies">Detalji</a></p>
+    ? `<p>${BRAND.name} uses the cookies needed to sign you in. With your consent we also count anonymous visits — never the content of your mail. <a href="/privacy/#cookies">Details</a></p>
        <div class="cookie-actions"><button type="button" class="btn btn-secondary" data-c="denied">Essential only</button><button type="button" class="btn btn-ink" data-c="granted">Allow analytics</button></div>`
-    : `<p>vahid.im koristi samo neophodne kolačiće za prijavu i zaštitu formi. Bez praćenja. <a href="/privacy/#cookies">Detalji</a></p>
-       <div class="cookie-actions"><button type="button" class="btn btn-ink" data-c="denied">U redu</button></div>`
+    : `<p>${BRAND.name} uses only the cookies needed to sign you in and protect the forms. No tracking. <a href="/privacy/#cookies">Details</a></p>
+       <div class="cookie-actions"><button type="button" class="btn btn-ink" data-c="denied">OK</button></div>`
   bar.addEventListener('click', (e) => {
     const c = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-c]')?.dataset.c as Consent | undefined
     if (!c) return
@@ -118,10 +123,40 @@ export function initSite() {
 }
 
 // ---------- footer ----------
+// Links come from branding.json (`links`); without it we show Privacy/Terms.
 export function footerLinks(cls = 'site-footer') {
   const f = document.createElement('footer')
   f.className = cls
   const year = new Date().getFullYear()
-  f.innerHTML = `<nav aria-label="Legal"><a href="https://vahid.im">vahid.im</a><a href="https://vahid.im">Kontakt</a><button type="button" class="linklike" data-cookie-settings>Kolačići</button></nav><span>© ${year} vahid.im</span>`
+  const links = BRAND.links.length
+    ? BRAND.links
+    : [{ label: 'Privacy', href: '/privacy/' }, { label: 'Terms', href: '/terms/' }]
+  const nav = document.createElement('nav')
+  nav.setAttribute('aria-label', 'Legal')
+  const home = document.createElement('a')
+  home.href = BRAND.url || '/'
+  home.textContent = BRAND.name
+  nav.append(home)
+  if (SITE.contactEmail) {
+    const contact = document.createElement('a')
+    contact.href = `mailto:${SITE.contactEmail}`
+    contact.textContent = 'Contact'
+    nav.append(contact)
+  }
+  for (const l of links) {
+    const a = document.createElement('a')
+    a.href = l.href
+    a.textContent = l.label
+    nav.append(a)
+  }
+  const cookie = document.createElement('button')
+  cookie.type = 'button'
+  cookie.className = 'linklike'
+  cookie.dataset.cookieSettings = ''
+  cookie.textContent = 'Cookies'
+  nav.append(cookie)
+  const copy = document.createElement('span')
+  copy.textContent = `© ${year} ${BRAND.name}`
+  f.append(nav, copy)
   return f
 }
