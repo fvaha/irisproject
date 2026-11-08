@@ -277,7 +277,7 @@ function renderLogin() {
     h('div', { className: 'login-footer' }, h('span', {}, 'MX → Auth → Inbox'), h('span', {}, location.hostname)))
   const form = h('form', { className: 'login-form', noValidate: true },
     emailF.wrap, pwF.wrap, ...(SITE.turnstileSiteKey ? [turnstileBox] : []), status, submit,
-    h('p', { className: 'login-foot' }, `Sign in with your mail account on ${brandHost()}.`))
+    h('p', { className: 'login-foot' }, BRAND.strings.loginNote ?? `Sign in with your mail account on ${brandHost()}.`))
   const right = h('main', { className: 'login-right' },
     h('div', { className: 'login-panel' }, h('h1', {}, 'Sign in'), form),
     footerLinks())
@@ -1382,8 +1382,7 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
       nav.sidebar,
       navItem('#/dmarc', 'shield', 'DMARC reports'),
       h('a', { href: viewHash(view), className: 'nav-item nav-mail', 'aria-current': 'page' }, icon('mail'), h('span', { className: 'nav-label' }, 'Mail')),
-      navSection('Temporary'),
-      navItem('#/temp', 'timer', 'Temporary inbox'),
+      ...(BRAND.hideTempInbox ? [] : [navSection('Temporary'), navItem('#/temp', 'timer', 'Temporary inbox')]),
       ...(is_admin ? [navSection('Admin'), navItem('#/admin', 'account', 'Admin')] : []),
       footerLinks('sidebar-footer'),
     ],
@@ -2366,7 +2365,7 @@ function renderSignedOut() {
     h('h1', {}, 'You’re signed out.'),
     h('p', { className: 'muted' }, `Thanks for using ${BRAND.name}. Your session and its mail-server password were removed from this device.`),
     h('a', { href: '#/', className: 'btn btn-ink btn-block' }, h('span', { className: 'btn-label' }, 'Sign in again')),
-    h('a', { href: '#/temp', className: 'link' }, 'Or get a temporary inbox →')))
+    ...(BRAND.hideTempInbox ? [] : [h('a', { href: '#/temp', className: 'link' }, 'Or get a temporary inbox →')])))
 }
 
 function renderNotFound() {
@@ -2376,7 +2375,7 @@ function renderNotFound() {
     h('h1', {}, 'This message got lost.'),
     h('p', { className: 'muted' }, 'The page you’re looking for doesn’t exist or has moved.'),
     h('a', { href: '#/', className: 'btn btn-ink btn-block' }, h('span', { className: 'btn-label' }, 'Go to inbox')),
-    h('a', { href: '#/temp', className: 'link' }, 'Get a temporary inbox →')))
+    ...(BRAND.hideTempInbox ? [] : [h('a', { href: '#/temp', className: 'link' }, 'Get a temporary inbox →')])))
 }
 
 // ---------- Admin dashboard ----------
@@ -2560,6 +2559,7 @@ function route() {
   window.scrollTo(0, 0)
   const r = location.hash.replace(/^#/, '') || '/'
   if (r === '/temp') {
+    if (BRAND.hideTempInbox) return renderNotFound()
     const saved = savedTemp()
     if (saved) { renderTempInbox(saved).catch(() => {}); return }
     return renderTempStart()

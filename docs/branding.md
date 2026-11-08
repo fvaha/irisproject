@@ -9,7 +9,7 @@ reload the page.
 
 | Deployment | File | Served as |
 |---|---|---|
-| RustMailStack package | `/etc/iris/branding.json` | `/branding.json` (Caddy `handle /branding.json`) |
+| RustMailStack package | `/etc/iris/branding.json` + `/etc/iris/branding/` | `/branding.json` and `/branding/*` (Caddy) |
 | Docker / manual install | `apps/web/dist/branding.json` | `/branding.json` |
 | Nothing (file missing) | — | built-in defaults: `IRIS` |
 
@@ -31,6 +31,14 @@ Every field is optional. Empty or missing values keep the built-in default.
   "themeColor": "#0F62FE",
   "logoUrl": "/acme-logo.svg",
   "faviconUrl": "/acme-favicon.svg",
+  "ogImageUrl": "/acme-og.png",
+  "hideTempInbox": true,
+  "strings": {
+    "cookieEssential": "Acme Mail uses only the cookies needed to sign you in.",
+    "cookieAnalytics": "Acme Mail counts anonymous visits only with your consent.",
+    "cookieDetails": "Details",
+    "loginNote": "Sign in with your Acme Mail account."
+  },
   "links": [
     { "label": "Privacy", "href": "/privacy/" },
     { "label": "Terms", "href": "/terms/" },
@@ -50,6 +58,9 @@ Every field is optional. Empty or missing values keep the built-in default.
 | `themeColor` | `theme-color` meta and the PWA manifest |
 | `logoUrl` | image that replaces the built-in envelope mark (SVG or PNG, square) |
 | `faviconUrl` | overrides `favicon.ico`, `favicon.svg` and `apple-touch-icon` |
+| `ogImageUrl` | 1200×630 social card image (`og:image` / `twitter:image`) |
+| `hideTempInbox` | `true` removes temporary inboxes from the UI (sidebar, 404, signed-out page) and answers `#/temp` with 404; server-side the feature is already off when `TEMP_INBOX_DOMAIN` is empty |
+| `strings.cookieEssential` / `.cookieAnalytics` / `.cookieDetails` / `.loginNote` | optional copy overrides for a localised deployment |
 | `links` | footer legal links; default is Privacy + Terms |
 
 ## What is *not* brandable here

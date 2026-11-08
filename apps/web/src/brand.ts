@@ -18,6 +18,14 @@ const env = import.meta.env
 
 export type BrandLink = { label: string; href: string }
 
+/** Optional copy overrides (e.g. a non-English deployment). */
+export type BrandStrings = {
+  cookieEssential?: string
+  cookieAnalytics?: string
+  cookieDetails?: string
+  loginNote?: string
+}
+
 export type Brand = {
   name: string
   tagline: string
@@ -28,7 +36,10 @@ export type Brand = {
   themeColor: string
   logoUrl: string
   faviconUrl: string
+  ogImageUrl: string
+  hideTempInbox: boolean
   links: BrandLink[]
+  strings: BrandStrings
 }
 
 export const DEFAULT_BRAND: Brand = {
@@ -41,7 +52,10 @@ export const DEFAULT_BRAND: Brand = {
   themeColor: env.VITE_BRAND_THEME_COLOR || '#B83232',
   logoUrl: '',
   faviconUrl: '',
+  ogImageUrl: env.VITE_BRAND_OG_IMAGE || '',
+  hideTempInbox: false,
   links: [],
+  strings: {},
 }
 
 export let BRAND: Brand = { ...DEFAULT_BRAND }
@@ -55,6 +69,12 @@ function merge(raw: unknown): Brand {
         .filter((l): l is BrandLink => !!l && typeof l === 'object' && typeof (l as BrandLink).label === 'string' && typeof (l as BrandLink).href === 'string')
         .map((l) => ({ label: l.label, href: l.href }))
     : DEFAULT_BRAND.links
+  const s = (j.strings && typeof j.strings === 'object' ? j.strings : {}) as Record<string, unknown>
+  const strings: BrandStrings = {}
+  if (typeof s.cookieEssential === 'string' && s.cookieEssential.trim()) strings.cookieEssential = s.cookieEssential.trim()
+  if (typeof s.cookieAnalytics === 'string' && s.cookieAnalytics.trim()) strings.cookieAnalytics = s.cookieAnalytics.trim()
+  if (typeof s.cookieDetails === 'string' && s.cookieDetails.trim()) strings.cookieDetails = s.cookieDetails.trim()
+  if (typeof s.loginNote === 'string' && s.loginNote.trim()) strings.loginNote = s.loginNote.trim()
   return {
     name: str(j.name, DEFAULT_BRAND.name),
     tagline: str(j.tagline, DEFAULT_BRAND.tagline),
@@ -65,7 +85,10 @@ function merge(raw: unknown): Brand {
     themeColor: str(j.themeColor, DEFAULT_BRAND.themeColor),
     logoUrl: str(j.logoUrl, DEFAULT_BRAND.logoUrl),
     faviconUrl: str(j.faviconUrl, DEFAULT_BRAND.faviconUrl),
+    ogImageUrl: str(j.ogImageUrl, DEFAULT_BRAND.ogImageUrl),
+    hideTempInbox: j.hideTempInbox === true,
     links,
+    strings,
   }
 }
 
@@ -116,6 +139,10 @@ function applyBrand() {
   setMeta('meta[property="og:site_name"]', 'content', BRAND.name)
   setMeta('meta[property="og:image:alt"]', 'content', `${BRAND.name} ${BRAND.product}`)
   setMeta('meta[name="twitter:image:alt"]', 'content', `${BRAND.name} ${BRAND.product}`)
+  if (BRAND.ogImageUrl) {
+    setMeta('meta[property="og:image"]', 'content', BRAND.ogImageUrl)
+    setMeta('meta[name="twitter:image"]', 'content', BRAND.ogImageUrl)
+  }
 
   // Static pages: swap the build-time name for the deployment's.
   if (document.body.dataset.page && BRAND.name !== DEFAULT_BRAND.name) {

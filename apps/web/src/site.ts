@@ -99,11 +99,37 @@ export function showCookieBanner(force = false) {
   bar.className = 'cookie-banner'
   bar.setAttribute('role', 'region')
   bar.setAttribute('aria-label', 'Cookie notice')
-  bar.innerHTML = hasAnalytics
-    ? `<p>${BRAND.name} uses the cookies needed to sign you in. With your consent we also count anonymous visits — never the content of your mail. <a href="/privacy/#cookies">Details</a></p>
-       <div class="cookie-actions"><button type="button" class="btn btn-secondary" data-c="denied">Essential only</button><button type="button" class="btn btn-ink" data-c="granted">Allow analytics</button></div>`
-    : `<p>${BRAND.name} uses only the cookies needed to sign you in and protect the forms. No tracking. <a href="/privacy/#cookies">Details</a></p>
-       <div class="cookie-actions"><button type="button" class="btn btn-ink" data-c="denied">OK</button></div>`
+
+  // Copy comes from branding.json `strings` when a deployment localises it.
+  const copy = document.createElement('p')
+  const text = hasAnalytics
+    ? BRAND.strings.cookieAnalytics ?? `${BRAND.name} uses the cookies needed to sign you in. With your consent we also count anonymous visits — never the content of your mail.`
+    : BRAND.strings.cookieEssential ?? `${BRAND.name} uses only the cookies needed to sign you in and protect the forms. No tracking.`
+  const details = document.createElement('a')
+  details.href = '/privacy/#cookies'
+  details.textContent = BRAND.strings.cookieDetails ?? 'Details'
+  copy.append(text, ' ', details)
+
+  const actions = document.createElement('div')
+  actions.className = 'cookie-actions'
+  if (hasAnalytics) {
+    for (const [choice, cls, label] of [['denied', 'btn btn-secondary', 'Essential only'], ['granted', 'btn btn-ink', 'Allow analytics']] as const) {
+      const b = document.createElement('button')
+      b.type = 'button'
+      b.className = cls
+      b.dataset.c = choice
+      b.textContent = label
+      actions.append(b)
+    }
+  } else {
+    const b = document.createElement('button')
+    b.type = 'button'
+    b.className = 'btn btn-ink'
+    b.dataset.c = 'denied'
+    b.textContent = 'OK'
+    actions.append(b)
+  }
+  bar.append(copy, actions)
   bar.addEventListener('click', (e) => {
     const c = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-c]')?.dataset.c as Consent | undefined
     if (!c) return
