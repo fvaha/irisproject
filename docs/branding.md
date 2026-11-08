@@ -11,7 +11,7 @@ reload the page.
 |---|---|---|
 | RustMailStack package | `/etc/iris/branding.json` + `/etc/iris/branding/` | `/branding.json` and `/branding/*` (Caddy) |
 | Docker / manual install | `apps/web/dist/branding.json` | `/branding.json` |
-| Nothing (file missing) | — | built-in defaults: `IRIS` |
+| Nothing (file missing) | none | built-in defaults: `IRIS` |
 
 The document is fetched once per page load with `cache: no-store`, so a reload
 picks up edits immediately.
